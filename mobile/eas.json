@@ -1,0 +1,57 @@
+{
+  "cli": {
+    "version": ">= 16.0.0",
+    "appVersionSource": "remote"
+  },
+  "build": {
+    "base": {
+      "node": "22.17.0",
+      "pnpm": "10.34.3",
+      "environment": "production",
+      "env": {
+        "EXPO_PUBLIC_LUMORA_API_URL": "https://api.your-domain.com"
+      }
+    },
+    "android-apk": {
+      "extends": "base",
+      "distribution": "internal",
+      "autoIncrement": true,
+      "android": {
+        "buildType": "apk"
+      }
+    },
+    "ios-adhoc": {
+      "extends": "base",
+      "distribution": "internal",
+      "autoIncrement": true,
+      "ios": {
+        "buildConfiguration": "Release"
+      }
+    },
+    "testflight": {
+      "extends": "base",
+      "distribution": "store",
+      "autoIncrement": true,
+      "ios": {
+        "buildConfiguration": "Release"
+      }
+    },
+    "development": {
+      "extends": "base",
+      "distribution": "internal",
+      "android": {
+        "buildType": "apk"
+      },
+      "ios": {
+        "simulator": true
+      }
+    }
+  },
+  "submit": {
+    "testflight": {
+      "ios": {
+        "language": "en-US"
+      }
+    }
+  }
+}

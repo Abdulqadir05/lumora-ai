@@ -1,0 +1,47 @@
+{
+  "expo": {
+    "name": "Lumora AI",
+    "slug": "lumora-ai",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "dark",
+    "backgroundColor": "#060B16",
+    "ios": {
+      "bundleIdentifier": "com.yourcompany.lumora",
+      "supportsTablet": true,
+      "config": {
+        "usesNonExemptEncryption": false
+      },
+      "icon": "./assets/icon.png",
+      "backgroundColor": "#060B16"
+    },
+    "android": {
+      "package": "ai.lumora.app",
+      "softwareKeyboardLayoutMode": "resize",
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "monochromeImage": "./assets/monochrome-icon.png",
+        "backgroundColor": "#060B16"
+      },
+      "backgroundColor": "#060B16"
+    },
+    "plugins": [
+      "expo-status-bar",
+      "expo-font",
+      [
+        "expo-splash-screen",
+        {
+          "image": "./assets/splash-icon.png",
+          "imageWidth": 160,
+          "resizeMode": "contain",
+          "backgroundColor": "#060B16"
+        }
+      ]
+    ],
+    "icon": "./assets/icon.png",
+    "scheme": "lumora",
+    "web": {
+      "favicon": "./assets/favicon.png"
+    }
+  }
+}

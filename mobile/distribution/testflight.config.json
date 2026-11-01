@@ -1,0 +1,30 @@
+{
+  "$comment": "TestFlight beta configuration used by scripts/testflight.mjs. Replace every value marked REPLACE/your-domain before running. bundleId is read from app.json.",
+  "locale": "en-US",
+  "betaAppDescription": "Lumora AI is a premium multi-model AI assistant. Chat with GPT-OSS 20B, GPT-OSS 120B and Qwen 3.8 27B, get live weather, news, crypto prices and currency conversion with cited sources, and keep your conversations privately on your device. This beta is for invited testers evaluating answer quality, streaming speed and reliability before a wider release.",
+  "feedbackEmail": "beta@your-domain.com",
+  "marketingUrl": "https://your-domain.com/lumora",
+  "privacyPolicyUrl": "https://your-domain.com/privacy",
+  "betaReview": {
+    "contactFirstName": "REPLACE",
+    "contactLastName": "REPLACE",
+    "contactPhone": "+1 555 000 0000",
+    "contactEmail": "beta@your-domain.com",
+    "demoAccountRequired": false,
+    "notes": "No account or login is required. Open the app and send any message, or tap a Quick Start card (for example Weather Assistant). Answers stream from our own backend service; live data (weather, news, crypto, exchange rates) is fetched from public providers and always cited. The app stores chat history only on the device."
+  },
+  "groups": {
+    "internal": {
+      "name": "Lumora Internal",
+      "feedbackEnabled": true
+    },
+    "external": {
+      "name": "Lumora Beta",
+      "feedbackEnabled": true,
+      "publicLinkEnabled": true,
+      "publicLinkLimitEnabled": true,
+      "publicLinkLimit": 500
+    }
+  },
+  "whatToTest": "Please try: (1) a long question and the Stop button while it streams, (2) switching models in the top bar, (3) a Quick Start card such as Weather Assistant or Crypto Market and tapping the numbered sources, (4) copying a code block, (5) closing and reopening the app to confirm your chat is restored. Send feedback with a screenshot from TestFlight (take a screenshot, then tap Share Beta Feedback) or email beta@your-domain.com."
+}
