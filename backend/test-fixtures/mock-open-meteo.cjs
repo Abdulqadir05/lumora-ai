@@ -1,4 +1,6 @@
 const nativeFetch = globalThis.fetch;
+const probeLookupCounts = new Map();
+const retryLookupCounts = new Map();
 
 function jsonResponse(payload) {
   return new Response(JSON.stringify(payload), {
@@ -12,13 +14,27 @@ globalThis.fetch = async (input, init) => {
 
   if (url.hostname === 'geocoding-api.open-meteo.com') {
     const name = url.searchParams.get('name') || '';
+    const normalizedName = name.normalize('NFKC').trim().replace(/\s+/g, ' ').toLowerCase();
     if (name === 'NetworkFailureSentinel') {
       const cause = Object.assign(new Error('fixture failure detail'), { code: 'ECONNRESET' });
       const error = new TypeError('fixture network failure detail', { cause });
       throw error;
     }
     if (name === 'HttpFailureSentinel') return new Response('fixture response body sentinel', { status: 503 });
+    if (name === 'RateLimitWeather') return new Response('{}', { status: 429 });
     if (/^(nosuchcity|search on google)$/i.test(name)) return jsonResponse({ results: [] });
+    if (name === 'RetryCity') {
+      const count = (retryLookupCounts.get(normalizedName) || 0) + 1;
+      retryLookupCounts.set(normalizedName, count);
+      if (count === 1) return jsonResponse({ results: [] });
+      return jsonResponse({ results: [{ name: `${name} #${count}`, admin1: 'Probe Region', country: 'Probe Test', latitude: 28.6, longitude: 77.2 }] });
+    }
+    if (/^Probe/.test(name)) {
+      const count = (probeLookupCounts.get(normalizedName) || 0) + 1;
+      probeLookupCounts.set(normalizedName, count);
+      if (normalizedName === 'probeconcurrent') await new Promise((resolve) => setTimeout(resolve, 350));
+      return jsonResponse({ results: [{ name: `${name} #${count}`, admin1: 'Probe Region', country: 'Probe Test', latitude: 28.6, longitude: 77.2 }] });
+    }
     return jsonResponse({
       results: [
         {

@@ -512,9 +512,83 @@ const WMO = {
 };
 
 /** Open-Meteo (keyless) — real current conditions + 3-day forecast. */
-async function getWeather(location, signal) {
-  const name = typeof location === 'string' ? location.trim() : '';
-  if (!name || name.length > 100) throw new HttpError(400, 'invalid_request', 'A location (max 100 characters) is required.');
+const WEATHER_CACHE_TTL_MS = 5 * 60 * 1000;
+const WEATHER_CACHE_MAX_ENTRIES = 128;
+const weatherCache = new Map();
+const weatherLookups = new Map();
+
+function normalizeWeatherCacheKey(location) {
+  return location.normalize('NFKC').trim().replace(/\s+/g, ' ').toLowerCase();
+}
+
+function pruneWeatherCache(now = Date.now()) {
+  for (const [key, entry] of weatherCache) {
+    if (entry.expiresAt <= now) weatherCache.delete(key);
+  }
+}
+
+function readWeatherCache(key) {
+  pruneWeatherCache();
+  const entry = weatherCache.get(key);
+  if (!entry) return null;
+  // Refresh insertion order for bounded LRU eviction and never return the stored object.
+  weatherCache.delete(key);
+  weatherCache.set(key, entry);
+  return structuredClone(entry.data);
+}
+
+function writeWeatherCache(key, data) {
+  pruneWeatherCache();
+  weatherCache.delete(key);
+  while (weatherCache.size >= WEATHER_CACHE_MAX_ENTRIES) {
+    weatherCache.delete(weatherCache.keys().next().value);
+  }
+  weatherCache.set(key, { data: structuredClone(data), expiresAt: Date.now() + WEATHER_CACHE_TTL_MS });
+}
+
+function subscribeWeatherLookup(key, shared, signal) {
+  shared.subscribers += 1;
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let released = false;
+    const release = () => {
+      if (released) return;
+      released = true;
+      shared.subscribers -= 1;
+      if (shared.subscribers === 0 && !shared.settled) {
+        // Remove the doomed lookup before aborting, so new callers start a fresh one.
+        if (weatherLookups.get(key) === shared) weatherLookups.delete(key);
+        shared.controller.abort();
+      }
+    };
+    const cleanup = () => signal?.removeEventListener('abort', onAbort);
+    const finish = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      release();
+      callback(value);
+    };
+    const onAbort = () => finish(reject, new HttpError(499, 'aborted', 'Request cancelled.'));
+
+    shared.promise.then(
+      (data) => {
+        try {
+          finish(resolve, structuredClone(data));
+        } catch (error) {
+          finish(reject, error);
+        }
+      },
+      (error) => finish(reject, error),
+    );
+    if (signal) {
+      if (signal.aborted) onAbort();
+      else signal.addEventListener('abort', onAbort, { once: true });
+    }
+  });
+}
+
+async function fetchWeather(name, signal) {
   const geo = await fetchData(
     `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(name)}&count=1&language=en&format=json`,
     { signal },
@@ -553,6 +627,34 @@ async function getWeather(location, signal) {
     providerUrl: 'https://open-meteo.com',
     retrievedAt: new Date().toISOString(),
   };
+}
+
+async function getWeather(location, signal) {
+  const name = typeof location === 'string' ? location.trim() : '';
+  if (!name || name.length > 100) throw new HttpError(400, 'invalid_request', 'A location (max 100 characters) is required.');
+  if (signal?.aborted) throw new HttpError(499, 'aborted', 'Request cancelled.');
+
+  const key = normalizeWeatherCacheKey(name);
+  const cached = readWeatherCache(key);
+  if (cached) return cached;
+
+  let shared = weatherLookups.get(key);
+  if (!shared) {
+    const controller = new AbortController();
+    shared = { controller, subscribers: 0, settled: false, promise: null };
+    const lookup = shared;
+    lookup.promise = fetchWeather(name, controller.signal)
+      .then((data) => {
+        if (!controller.signal.aborted && lookup.subscribers > 0) writeWeatherCache(key, data);
+        return data;
+      })
+      .finally(() => {
+        lookup.settled = true;
+        if (weatherLookups.get(key) === lookup) weatherLookups.delete(key);
+      });
+    weatherLookups.set(key, shared);
+  }
+  return subscribeWeatherLookup(key, shared, signal);
 }
 
 /** open.er-api.com (keyless) — real exchange rates with publication timestamp. */
@@ -750,7 +852,12 @@ async function runTools(plan, signal, onStatus) {
     const type = jobs[i][0];
     if (r.status === 'rejected') {
       const e = r.reason;
-      const safe = e instanceof HttpError && (e.status < 500 || e.code === 'search_not_configured') ? e.message : 'the provider could not be reached';
+      const weatherRateLimited = type === 'weather' && e instanceof HttpError && e.code === 'tool_rate_limited';
+      const safe = weatherRateLimited
+        ? 'the weather provider is temporarily rate limiting requests; please try again shortly'
+        : e instanceof HttpError && (e.status < 500 || e.code === 'search_not_configured')
+          ? e.message
+          : 'the provider could not be reached';
       errors.push({ type, message: `${TOOL_LABEL[type]} could not be retrieved: ${safe}` });
       return;
     }

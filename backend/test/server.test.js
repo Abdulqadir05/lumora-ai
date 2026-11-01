@@ -485,6 +485,91 @@ test('weather lookup failures report the failure and never emit a success card o
   assert.doesNotMatch(assistantText, /\b\d+°C|\[1\]/);
 });
 
+test('weather cache reuses successful results by normalized location without collisions', async () => {
+  const { url } = await startServer({ LUMORA_CLIENT_TOKENS: TOKEN });
+  const lookup = async (location) => {
+    const response = await fetch(`${url}/api/tools/weather`, {
+      method: 'POST',
+      headers: auth,
+      body: JSON.stringify({ location }),
+    });
+    assert.equal(response.status, 200);
+    return (await response.json()).data;
+  };
+
+  const first = await lookup('ProbeReuse');
+  const repeated = await lookup('ProbeReuse');
+  const caseVariant = await lookup('probereuse');
+  const different = await lookup('ProbeDifferent');
+
+  assert.equal(first.location, 'ProbeReuse #1, Probe Region, Probe Test');
+  assert.deepEqual(repeated, first);
+  assert.deepEqual(caseVariant, first);
+  assert.equal(different.location, 'ProbeDifferent #1, Probe Region, Probe Test');
+  assert.notEqual(different.location, first.location);
+});
+
+test('weather failures are not cached', async () => {
+  const { url } = await startServer({ LUMORA_CLIENT_TOKENS: TOKEN });
+  const lookup = () => fetch(`${url}/api/tools/weather`, {
+    method: 'POST',
+    headers: auth,
+    body: JSON.stringify({ location: 'RetryCity' }),
+  });
+
+  const failed = await lookup();
+  assert.equal(failed.status, 404);
+  assert.equal((await failed.json()).error.code, 'location_not_found');
+
+  const retried = await lookup();
+  assert.equal(retried.status, 200);
+  const data = (await retried.json()).data;
+  assert.equal(data.location, 'RetryCity #2, Probe Region, Probe Test');
+});
+
+test('concurrent weather lookups are shared and one caller cancellation does not abort the other', async () => {
+  const { url } = await startServer({ LUMORA_CLIENT_TOKENS: TOKEN });
+  const request = (signal) => fetch(`${url}/api/tools/weather`, {
+    method: 'POST',
+    headers: auth,
+    body: JSON.stringify({ location: 'ProbeConcurrent' }),
+    signal,
+  });
+  const firstController = new AbortController();
+  const first = request(firstController.signal);
+  const firstSettled = first.then((response) => ({ response }), (error) => ({ error }));
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  const second = request();
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  firstController.abort();
+
+  const firstResult = await firstSettled;
+  assert.equal(firstResult.error?.name, 'AbortError');
+  const secondResponse = await second;
+  assert.equal(secondResponse.status, 200);
+  const data = (await secondResponse.json()).data;
+  assert.equal(data.location, 'ProbeConcurrent #1, Probe Region, Probe Test');
+});
+
+test('weather provider rate limits are reported clearly without success cards or citations', async () => {
+  const response = await fetch(`${api}/api/chat/stream`, {
+    method: 'POST',
+    headers: auth,
+    body: chatBody('Current weather of RateLimitWeather'),
+  });
+  assert.equal(response.status, 200);
+  const events = parseSSE(await response.text());
+  const meta = events.find((event) => event.event === 'meta')?.data;
+  const assistantText = events.filter((event) => event.event === 'token').map((event) => event.data.t).join('');
+
+  assert.deepEqual(meta?.tools, []);
+  assert.deepEqual(meta?.sources, []);
+  assert.equal(meta?.toolErrors?.[0]?.type, 'weather');
+  assert.match(meta?.toolErrors?.[0]?.message || '', /temporarily rate limiting/i);
+  assert.match(assistantText, /couldn't retrieve live weather/i);
+  assert.doesNotMatch(assistantText, /\b\d+°C|\[1\]/);
+});
+
 test('provider failures log safe diagnostics while preserving public errors', async () => {
   const { url, child } = await startServer({ LUMORA_CLIENT_TOKENS: TOKEN });
   const logLines = [];
