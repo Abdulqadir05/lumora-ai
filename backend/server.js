@@ -551,6 +551,7 @@ const WMO = {
 };
 
 /** Open-Meteo (keyless) — real current conditions + 3-day forecast. */
+const WEATHER_RELAY_BASE_URL = new URL('https://lumora-weather-relay.abdulqadir04a.workers.dev');
 const WEATHER_CACHE_TTL_MS = 5 * 60 * 1000;
 const WEATHER_CACHE_MAX_ENTRIES = 128;
 const weatherCache = new Map();
@@ -628,19 +629,21 @@ function subscribeWeatherLookup(key, shared, signal) {
 }
 
 async function fetchWeather(name, signal) {
-  const geo = await fetchData(
-    `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(name)}&count=1&language=en&format=json`,
-    { signal, diagnosticStage: 'weather_geocoding' },
-  );
+  const geocodingUrl = new URL('/geocoding', WEATHER_RELAY_BASE_URL);
+  geocodingUrl.search = new URLSearchParams({ name, count: '1', language: 'en', format: 'json' }).toString();
+  const geo = await fetchData(geocodingUrl, { method: 'GET', signal, diagnosticStage: 'weather_geocoding' });
   const place = geo?.results?.[0];
   if (!place) throw new HttpError(404, 'location_not_found', `Could not find a location named "${clip(name, 60)}".`);
-  const w = await fetchData(
-    `https://api.open-meteo.com/v1/forecast?latitude=${place.latitude}&longitude=${place.longitude}` +
-      '&current=temperature_2m,apparent_temperature,relative_humidity_2m,weather_code,wind_speed_10m' +
-      '&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max' +
-      '&timezone=auto&forecast_days=4',
-    { signal, diagnosticStage: 'weather_forecast' },
-  );
+  const forecastUrl = new URL('/forecast', WEATHER_RELAY_BASE_URL);
+  forecastUrl.search = new URLSearchParams({
+    latitude: String(place.latitude),
+    longitude: String(place.longitude),
+    current: 'temperature_2m,apparent_temperature,relative_humidity_2m,weather_code,wind_speed_10m',
+    daily: 'weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max',
+    timezone: 'auto',
+    forecast_days: '4',
+  }).toString();
+  const w = await fetchData(forecastUrl, { method: 'GET', signal, diagnosticStage: 'weather_forecast' });
   const c = w?.current;
   const d = w?.daily;
   if (!c || !d?.time) throw new HttpError(502, 'tool_malformed', 'Weather provider returned malformed data');

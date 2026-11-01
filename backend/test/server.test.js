@@ -450,6 +450,19 @@ test('weather phrasing resolves the city and gives both GPT-OSS and Qwen the sam
   assert.equal(answers[0], answers[3]);
 });
 
+test('weather requests use the Worker GET endpoints with only their allowed parameters', async () => {
+  const response = await fetch(`${api}/api/tools/weather`, {
+    method: 'POST',
+    headers: auth,
+    body: JSON.stringify({ location: 'WorkerRouteProbe' }),
+  });
+  assert.equal(response.status, 200);
+  const data = (await response.json()).data;
+  assert.equal(data.location, 'WorkerRouteProbe, Test Region, Test Country');
+  assert.equal(data.provider, 'Open-Meteo');
+  assert.equal(data.providerUrl, 'https://open-meteo.com');
+});
+
 test('missing weather location asks for a city without generating a tool card or source', async () => {
   const response = await fetch(`${api}/api/chat/stream`, {
     method: 'POST',
@@ -618,7 +631,7 @@ test('provider failures log safe diagnostics while preserving public errors', as
   const upstreamHttp = diagnostics.find((entry) => entry.lumoraCode === 'tool_http');
   assert.deepEqual(network, {
     stage: 'weather_geocoding',
-    providerHostname: 'geocoding-api.open-meteo.com',
+    providerHostname: 'lumora-weather-relay.abdulqadir04a.workers.dev',
     errorName: 'TypeError',
     lumoraCode: 'tool_network',
     causeCode: 'ECONNRESET',
@@ -627,7 +640,7 @@ test('provider failures log safe diagnostics while preserving public errors', as
   });
   assert.deepEqual(upstreamHttp, {
     stage: 'weather_geocoding',
-    providerHostname: 'geocoding-api.open-meteo.com',
+    providerHostname: 'lumora-weather-relay.abdulqadir04a.workers.dev',
     errorName: 'Error',
     httpStatus: 503,
     lumoraCode: 'tool_http',
@@ -693,7 +706,7 @@ test('geocoding and forecast 429 diagnostics use fixed stages and only sanitized
   const forecast = diagnostics.find((entry) => entry.stage === 'weather_forecast');
   assert.deepEqual(geocoding, {
     stage: 'weather_geocoding',
-    providerHostname: 'geocoding-api.open-meteo.com',
+    providerHostname: 'lumora-weather-relay.abdulqadir04a.workers.dev',
     errorName: 'Error',
     httpStatus: 429,
     lumoraCode: 'tool_rate_limited',
@@ -704,7 +717,7 @@ test('geocoding and forecast 429 diagnostics use fixed stages and only sanitized
   assert.ok(Number.isInteger(geocoding.retryAfterSeconds) && geocoding.retryAfterSeconds > 0 && geocoding.retryAfterSeconds <= 60);
   assert.deepEqual(forecast, {
     stage: 'weather_forecast',
-    providerHostname: 'api.open-meteo.com',
+    providerHostname: 'lumora-weather-relay.abdulqadir04a.workers.dev',
     errorName: 'Error',
     httpStatus: 429,
     lumoraCode: 'tool_rate_limited',

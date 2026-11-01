@@ -9,12 +9,24 @@ function jsonResponse(payload) {
   });
 }
 
+function assertQuery(url, expected) {
+  const actualKeys = [...url.searchParams.keys()].sort();
+  const expectedKeys = Object.keys(expected).sort();
+  if (actualKeys.length !== expectedKeys.length || actualKeys.some((key, index) => key !== expectedKeys[index]))
+    throw new Error('Unexpected weather relay query parameters');
+  for (const [key, value] of Object.entries(expected)) {
+    if (url.searchParams.get(key) !== value) throw new Error('Unexpected weather relay query value');
+  }
+}
+
 globalThis.fetch = async (input, init) => {
   if ('diagnosticStage' in (init || {})) throw new Error('diagnostic stage must not be forwarded to fetch');
-  const url = new URL(typeof input === 'string' ? input : input.url);
+  const url = new URL(typeof input === 'string' || input instanceof URL ? input : input.url);
 
-  if (url.hostname === 'geocoding-api.open-meteo.com') {
+  if (url.hostname === 'lumora-weather-relay.abdulqadir04a.workers.dev' && url.pathname === '/geocoding') {
+    if ((init?.method || 'GET') !== 'GET') throw new Error('Weather relay requests must use GET');
     const name = url.searchParams.get('name') || '';
+    assertQuery(url, { name, count: '1', language: 'en', format: 'json' });
     const normalizedName = name.normalize('NFKC').trim().replace(/\s+/g, ' ').toLowerCase();
     if (name === 'GeocodeRateLimitSentinel') {
       return new Response('fixture geocoding response body sentinel', {
@@ -65,8 +77,19 @@ globalThis.fetch = async (input, init) => {
     });
   }
 
-  if (url.hostname === 'api.open-meteo.com') {
-    if (url.searchParams.get('latitude') === '45.6789' && url.searchParams.get('longitude') === '-123.4567') {
+  if (url.hostname === 'lumora-weather-relay.abdulqadir04a.workers.dev' && url.pathname === '/forecast') {
+    if ((init?.method || 'GET') !== 'GET') throw new Error('Weather relay requests must use GET');
+    const latitude = url.searchParams.get('latitude');
+    const longitude = url.searchParams.get('longitude');
+    assertQuery(url, {
+      latitude,
+      longitude,
+      current: 'temperature_2m,apparent_temperature,relative_humidity_2m,weather_code,wind_speed_10m',
+      daily: 'weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max',
+      timezone: 'auto',
+      forecast_days: '4',
+    });
+    if (latitude === '45.6789' && longitude === '-123.4567') {
       return new Response('fixture forecast response body sentinel', {
         status: 429,
         headers: {
@@ -96,6 +119,13 @@ globalThis.fetch = async (input, init) => {
       },
     });
   }
+
+  if (
+    url.hostname === 'lumora-weather-relay.abdulqadir04a.workers.dev' ||
+    url.hostname === 'geocoding-api.open-meteo.com' ||
+    url.hostname === 'api.open-meteo.com'
+  )
+    throw new Error('Unexpected weather relay host or path');
 
   return nativeFetch(input, init);
 };
