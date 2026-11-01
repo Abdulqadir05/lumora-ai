@@ -58,6 +58,15 @@ function isSecureProviderUrl(value) {
 
 function parseTrustedProxyRanges(raw) {
   if (!raw || raw === '0') return { value: false, error: false };
+  // Render terminates public TLS at its edge and sends X-Forwarded-Proto to
+  // the web service over HTTP. Trust only that scheme signal in Render's web
+  // runtime; keep Express proxy trust disabled so X-Forwarded-For stays ignored.
+  if (raw.toLowerCase() === 'render') {
+    const isRenderWebService = process.env.RENDER === 'true' && process.env.RENDER_SERVICE_TYPE === 'web';
+    return isRenderWebService
+      ? { value: false, renderHttps: true, error: false }
+      : { value: false, renderHttps: false, error: true };
+  }
   if (/^\d+$/.test(raw)) {
     // Keep hop-count trust for development/test only. In deployed environments
     // numeric trust can accept spoofed forwarding headers on direct connections.
@@ -79,6 +88,7 @@ function parseTrustedProxyRanges(raw) {
 
 const TRUST_PROXY_CONFIG = parseTrustedProxyRanges(TRUST_PROXY_RAW);
 const TRUST_PROXY = TRUST_PROXY_CONFIG.value;
+const TRUST_RENDER_HTTPS = TRUST_PROXY_CONFIG.renderHttps === true;
 
 const KEYS = {
   tavily: process.env.TAVILY_API_KEY || '',
@@ -140,7 +150,7 @@ if (REQUIRE_SECURE_CONFIG && !isSecureProviderUrl(LLM.baseUrl)) {
   process.exit(1);
 }
 if (TRUST_PROXY_CONFIG.error) {
-  console.error('[lumora] TRUST_PROXY must be 0 or a comma-separated list of proxy IPs/CIDRs; deployed modes do not allow hop counts. Refusing to start.');
+  console.error('[lumora] TRUST_PROXY must be 0, "render" on a Render web service, or a comma-separated list of proxy IPs/CIDRs; deployed modes do not allow hop counts. Refusing to start.');
   process.exit(1);
 }
 if (!CLIENT_TOKENS.length) console.warn('[lumora] No LUMORA_CLIENT_TOKENS set — auth disabled for loopback development only.');
@@ -867,9 +877,10 @@ app.use((req, res, next) => {
 // HTTPS is taken from the socket or from a configured trusted proxy only.
 app.use((req, res, next) => {
   if (REQUIRE_SECURE_CONFIG) {
-    const forwardedProto = req.get('x-forwarded-proto');
-    const forwardedProtoInvalid = !req.socket.encrypted && forwardedProto && forwardedProto.trim().toLowerCase() !== 'https';
-    if (!req.secure || forwardedProtoInvalid)
+    const forwardedProto = (req.get('x-forwarded-proto') || '').trim().toLowerCase();
+    const forwardedProtoInvalid = !req.socket.encrypted && forwardedProto && forwardedProto !== 'https';
+    const secureViaRender = TRUST_RENDER_HTTPS && forwardedProto === 'https';
+    if ((!req.secure && !secureViaRender) || forwardedProtoInvalid)
       return sendError(res, new HttpError(403, 'https_required', 'HTTPS is required.'));
   }
   next();

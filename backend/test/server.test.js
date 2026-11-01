@@ -667,9 +667,10 @@ test('production refuses weak tokens, HTTP upstreams, and numeric proxy hop coun
   await assert.rejects(startServer({ NODE_ENV: 'production', LUMORA_CLIENT_TOKENS: 'too-short', LLM_BASE_URL: 'https://api.groq.com/openai/v1' }), (e) => e.code === 1);
   await assert.rejects(startServer({ NODE_ENV: 'production', LUMORA_CLIENT_TOKENS: TOKEN }), (e) => e.code === 1);
   await assert.rejects(startServer({ NODE_ENV: 'production', LUMORA_CLIENT_TOKENS: TOKEN, LLM_BASE_URL: 'https://api.groq.com/openai/v1', TRUST_PROXY: '1' }), (e) => e.code === 1);
+  await assert.rejects(startServer({ NODE_ENV: 'production', LUMORA_CLIENT_TOKENS: TOKEN, LLM_BASE_URL: 'https://api.groq.com/openai/v1', TRUST_PROXY: 'render' }), (e) => e.code === 1);
 });
 
-test('production HTTPS enforcement ignores untrusted forwarded headers and accepts a configured proxy', async () => {
+test('production HTTPS enforcement accepts only trusted proxy scheme signals', async () => {
   const direct = await startServer({ NODE_ENV: 'production', LUMORA_CLIENT_TOKENS: TOKEN, LLM_BASE_URL: 'https://api.groq.com/openai/v1' });
   const spoofed = await fetch(`${direct.url}/api/health`, { headers: { 'X-Forwarded-Proto': 'https' } });
   assert.equal(spoofed.status, 403);
@@ -678,4 +679,36 @@ test('production HTTPS enforcement ignores untrusted forwarded headers and accep
   assert.equal((await fetch(`${proxied.url}/api/health`, { headers: { 'X-Forwarded-Proto': 'https' } })).status, 200);
   assert.equal((await fetch(`${proxied.url}/api/health`, { headers: { 'X-Forwarded-Proto': 'http' } })).status, 403);
   assert.equal((await fetch(`${proxied.url}/api/health`, { headers: { 'X-Forwarded-Proto': 'https, http' } })).status, 403);
+
+  const render = await startServer({
+    NODE_ENV: 'production',
+    LUMORA_CLIENT_TOKENS: TOKEN,
+    LLM_BASE_URL: 'https://api.groq.com/openai/v1',
+    TRUST_PROXY: 'render',
+    RENDER: 'true',
+    RENDER_SERVICE_TYPE: 'web',
+  });
+  assert.equal((await fetch(`${render.url}/api/health`, { headers: { 'X-Forwarded-Proto': 'https' } })).status, 200);
+  assert.equal((await fetch(`${render.url}/api/health`, { headers: { 'X-Forwarded-Proto': 'http' } })).status, 403);
+  assert.equal((await fetch(`${render.url}/api/health`, { headers: { 'X-Forwarded-Proto': 'https, http' } })).status, 403);
+  assert.equal((await fetch(`${render.url}/api/models`, { headers: { 'X-Forwarded-Proto': 'https' } })).status, 401);
+});
+
+test('Render scheme support does not trust spoofed forwarded client IPs', async () => {
+  const render = await startServer({
+    NODE_ENV: 'production',
+    LUMORA_CLIENT_TOKENS: TOKEN,
+    LLM_BASE_URL: 'https://api.groq.com/openai/v1',
+    TRUST_PROXY: 'render',
+    RENDER: 'true',
+    RENDER_SERVICE_TYPE: 'web',
+    API_RATE_PER_MIN: '2',
+  });
+  const responses = [];
+  for (let i = 1; i <= 3; i++) {
+    responses.push(await fetch(`${render.url}/api/health`, {
+      headers: { 'X-Forwarded-Proto': 'https', 'X-Forwarded-For': `198.51.100.${i}` },
+    }));
+  }
+  assert.deepEqual(responses.map((response) => response.status), [200, 200, 429]);
 });
