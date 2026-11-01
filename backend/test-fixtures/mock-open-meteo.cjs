@@ -10,11 +10,28 @@ function jsonResponse(payload) {
 }
 
 globalThis.fetch = async (input, init) => {
+  if ('diagnosticStage' in (init || {})) throw new Error('diagnostic stage must not be forwarded to fetch');
   const url = new URL(typeof input === 'string' ? input : input.url);
 
   if (url.hostname === 'geocoding-api.open-meteo.com') {
     const name = url.searchParams.get('name') || '';
     const normalizedName = name.normalize('NFKC').trim().replace(/\s+/g, ' ').toLowerCase();
+    if (name === 'GeocodeRateLimitSentinel') {
+      return new Response('fixture geocoding response body sentinel', {
+        status: 429,
+        headers: {
+          'retry-after': new Date(Date.now() + 60_000).toUTCString(),
+          'ratelimit-limit': '999999999999999999999999',
+          'ratelimit-remaining': '0',
+          'ratelimit-reset': 'not-a-number',
+        },
+      });
+    }
+    if (name === 'ForecastRateLimitSentinel') {
+      return jsonResponse({
+        results: [{ name, admin1: 'Probe Region', country: 'Probe Test', latitude: 45.6789, longitude: -123.4567 }],
+      });
+    }
     if (name === 'NetworkFailureSentinel') {
       const cause = Object.assign(new Error('fixture failure detail'), { code: 'ECONNRESET' });
       const error = new TypeError('fixture network failure detail', { cause });
@@ -49,6 +66,17 @@ globalThis.fetch = async (input, init) => {
   }
 
   if (url.hostname === 'api.open-meteo.com') {
+    if (url.searchParams.get('latitude') === '45.6789' && url.searchParams.get('longitude') === '-123.4567') {
+      return new Response('fixture forecast response body sentinel', {
+        status: 429,
+        headers: {
+          'retry-after': '12',
+          'ratelimit-limit': '600',
+          'ratelimit-remaining': '0',
+          'ratelimit-reset': '60',
+        },
+      });
+    }
     return jsonResponse({
       timezone: 'Asia/Kolkata',
       current: {

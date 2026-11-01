@@ -253,9 +253,43 @@ function linkedController(parent, timeoutMs) {
 }
 
 /** fetch() with timeout, cancellation and JSON/text parsing for tool providers. */
-async function fetchData(url, { signal, timeout = LIMITS.toolTimeoutMs, as = 'json', ...init } = {}) {
+const PROVIDER_DIAGNOSTIC_STAGES = new Set(['weather_geocoding', 'weather_forecast']);
+const MAX_RATE_LIMIT_DIAGNOSTIC_VALUE = 2_147_483_647;
+const MAX_RETRY_AFTER_SECONDS = 86_400;
+
+function boundedRateLimitValue(value) {
+  if (typeof value !== 'string' || !/^\d{1,15}$/.test(value.trim())) return undefined;
+  const number = Number(value.trim());
+  return Number.isSafeInteger(number) && number <= MAX_RATE_LIMIT_DIAGNOSTIC_VALUE ? number : undefined;
+}
+
+function retryAfterSeconds(value, now = Date.now()) {
+  if (typeof value !== 'string' || !value.trim()) return undefined;
+  const normalized = value.trim();
+  if (/^\d{1,15}$/.test(normalized)) return Math.min(Number(normalized), MAX_RETRY_AFTER_SECONDS);
+  const date = Date.parse(normalized);
+  if (!Number.isFinite(date)) return undefined;
+  return Math.min(MAX_RETRY_AFTER_SECONDS, Math.max(0, Math.ceil((date - now) / 1000)));
+}
+
+function rateLimitDiagnosticMetadata(headers) {
+  const retryAfter = retryAfterSeconds(headers.get('retry-after'));
+  const limit = boundedRateLimitValue(headers.get('ratelimit-limit'));
+  const remaining = boundedRateLimitValue(headers.get('ratelimit-remaining'));
+  const reset = boundedRateLimitValue(headers.get('ratelimit-reset'));
+  return {
+    ...(retryAfter !== undefined ? { retryAfterSeconds: retryAfter } : {}),
+    ...(limit !== undefined ? { rateLimitLimit: limit } : {}),
+    ...(remaining !== undefined ? { rateLimitRemaining: remaining } : {}),
+    ...(reset !== undefined ? { rateLimitResetSeconds: reset } : {}),
+  };
+}
+
+async function fetchData(url, { signal, timeout = LIMITS.toolTimeoutMs, as = 'json', diagnosticStage, ...init } = {}) {
   const link = linkedController(signal, timeout);
   let upstreamStatus;
+  let rateLimitMetadata = {};
+  const stage = PROVIDER_DIAGNOSTIC_STAGES.has(diagnosticStage) ? diagnosticStage : undefined;
   const logFailure = (error, { timedOut = false, lumoraCode } = {}) => {
     let providerHostname = 'unknown';
     try {
@@ -266,12 +300,14 @@ async function fetchData(url, { signal, timeout = LIMITS.toolTimeoutMs, as = 'js
     const safeField = (value) => (typeof value === 'string' && /^[A-Za-z0-9_.-]{1,64}$/.test(value) ? value : undefined);
     const cause = error instanceof HttpError ? undefined : error?.cause || error;
     const details = {
+      ...(stage ? { stage } : {}),
       providerHostname,
       errorName: safeField(error?.name) || 'Error',
       ...(Number.isInteger(upstreamStatus) ? { httpStatus: upstreamStatus } : {}),
       ...(safeField(lumoraCode) ? { lumoraCode: safeField(lumoraCode) } : {}),
       ...(safeField(cause?.code) ? { causeCode: safeField(cause.code) } : {}),
       ...(safeField(cause?.name) ? { causeName: safeField(cause.name) } : {}),
+      ...rateLimitMetadata,
       timedOut,
     };
     console.error('[lumora] provider request failed', JSON.stringify(details));
@@ -279,7 +315,10 @@ async function fetchData(url, { signal, timeout = LIMITS.toolTimeoutMs, as = 'js
   try {
     const res = await fetch(url, { ...init, signal: link.ctrl.signal });
     upstreamStatus = res.status;
-    if (res.status === 429) throw new HttpError(503, 'tool_rate_limited', 'Provider rate limit reached — try again in a minute');
+    if (res.status === 429) {
+      rateLimitMetadata = rateLimitDiagnosticMetadata(res.headers);
+      throw new HttpError(503, 'tool_rate_limited', 'Provider rate limit reached — try again in a minute');
+    }
     if (!res.ok) throw new HttpError(502, 'tool_http', `Provider responded with HTTP ${res.status}`);
     if (as === 'text') return await res.text();
     try {
@@ -591,7 +630,7 @@ function subscribeWeatherLookup(key, shared, signal) {
 async function fetchWeather(name, signal) {
   const geo = await fetchData(
     `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(name)}&count=1&language=en&format=json`,
-    { signal },
+    { signal, diagnosticStage: 'weather_geocoding' },
   );
   const place = geo?.results?.[0];
   if (!place) throw new HttpError(404, 'location_not_found', `Could not find a location named "${clip(name, 60)}".`);
@@ -600,7 +639,7 @@ async function fetchWeather(name, signal) {
       '&current=temperature_2m,apparent_temperature,relative_humidity_2m,weather_code,wind_speed_10m' +
       '&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max' +
       '&timezone=auto&forecast_days=4',
-    { signal },
+    { signal, diagnosticStage: 'weather_forecast' },
   );
   const c = w?.current;
   const d = w?.daily;

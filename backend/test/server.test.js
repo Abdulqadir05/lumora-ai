@@ -617,6 +617,7 @@ test('provider failures log safe diagnostics while preserving public errors', as
   const network = diagnostics.find((entry) => entry.lumoraCode === 'tool_network');
   const upstreamHttp = diagnostics.find((entry) => entry.lumoraCode === 'tool_http');
   assert.deepEqual(network, {
+    stage: 'weather_geocoding',
     providerHostname: 'geocoding-api.open-meteo.com',
     errorName: 'TypeError',
     lumoraCode: 'tool_network',
@@ -625,6 +626,7 @@ test('provider failures log safe diagnostics while preserving public errors', as
     timedOut: false,
   });
   assert.deepEqual(upstreamHttp, {
+    stage: 'weather_geocoding',
     providerHostname: 'geocoding-api.open-meteo.com',
     errorName: 'Error',
     httpStatus: 503,
@@ -632,6 +634,91 @@ test('provider failures log safe diagnostics while preserving public errors', as
     timedOut: false,
   });
   assert.doesNotMatch(lines.join('\n'), /NetworkFailureSentinel|HttpFailureSentinel|fixture failure detail|fixture response body sentinel|Authorization|Bearer/);
+});
+
+test('geocoding and forecast 429 diagnostics use fixed stages and only sanitized metadata', async () => {
+  const { url, child } = await startServer({ LUMORA_CLIENT_TOKENS: TOKEN });
+  const logLines = [];
+  let stderrBuffer = '';
+  const diagnosticsReady = new Promise((resolve) => {
+    const onStderr = (chunk) => {
+      const pieces = (stderrBuffer + chunk.toString()).split('\n');
+      stderrBuffer = pieces.pop();
+      for (const line of pieces) {
+        if (line.includes('[lumora] provider request failed')) logLines.push(line);
+      }
+      if (logLines.length >= 2) {
+        clearTimeout(timer);
+        child.stderr.off('data', onStderr);
+        resolve(logLines.slice(0, 2));
+      }
+    };
+    const timer = setTimeout(() => {
+      child.stderr.off('data', onStderr);
+      resolve(logLines);
+    }, 1500);
+    child.stderr.on('data', onStderr);
+  });
+
+  const geocodingResponse = await fetch(`${url}/api/tools/weather`, {
+    method: 'POST',
+    headers: auth,
+    body: JSON.stringify({ location: 'GeocodeRateLimitSentinel' }),
+  });
+  assert.equal(geocodingResponse.status, 503);
+  assert.deepEqual((await geocodingResponse.json()).error, {
+    code: 'tool_rate_limited',
+    message: 'Provider rate limit reached — try again in a minute',
+  });
+
+  const forecastResponse = await fetch(`${url}/api/chat/stream`, {
+    method: 'POST',
+    headers: auth,
+    body: chatBody('Current weather of ForecastRateLimitSentinel'),
+  });
+  assert.equal(forecastResponse.status, 200);
+  const events = parseSSE(await forecastResponse.text());
+  const meta = events.find((event) => event.event === 'meta')?.data;
+  const assistantText = events.filter((event) => event.event === 'token').map((event) => event.data.t).join('');
+  assert.deepEqual(meta?.tools, []);
+  assert.deepEqual(meta?.sources, []);
+  assert.equal(meta?.toolErrors?.[0]?.type, 'weather');
+  assert.match(meta?.toolErrors?.[0]?.message || '', /temporarily rate limiting/i);
+  assert.match(assistantText, /couldn't retrieve live weather/i);
+  assert.doesNotMatch(assistantText, /\b\d+°C|\[1\]/);
+
+  const lines = await diagnosticsReady;
+  const diagnostics = lines.map((line) => JSON.parse(line.slice(line.indexOf('{'))));
+  const geocoding = diagnostics.find((entry) => entry.stage === 'weather_geocoding');
+  const forecast = diagnostics.find((entry) => entry.stage === 'weather_forecast');
+  assert.deepEqual(geocoding, {
+    stage: 'weather_geocoding',
+    providerHostname: 'geocoding-api.open-meteo.com',
+    errorName: 'Error',
+    httpStatus: 429,
+    lumoraCode: 'tool_rate_limited',
+    retryAfterSeconds: geocoding.retryAfterSeconds,
+    rateLimitRemaining: 0,
+    timedOut: false,
+  });
+  assert.ok(Number.isInteger(geocoding.retryAfterSeconds) && geocoding.retryAfterSeconds > 0 && geocoding.retryAfterSeconds <= 60);
+  assert.deepEqual(forecast, {
+    stage: 'weather_forecast',
+    providerHostname: 'api.open-meteo.com',
+    errorName: 'Error',
+    httpStatus: 429,
+    lumoraCode: 'tool_rate_limited',
+    retryAfterSeconds: 12,
+    rateLimitLimit: 600,
+    rateLimitRemaining: 0,
+    rateLimitResetSeconds: 60,
+    timedOut: false,
+  });
+  const serializedLogs = lines.join('\n');
+  assert.doesNotMatch(
+    serializedLogs,
+    /GeocodeRateLimitSentinel|ForecastRateLimitSentinel|fixture .*response body sentinel|\?name=|latitude=|longitude=|Authorization|Bearer|0123456789abcdef0123456789abcdef/,
+  );
 });
 
 test('an explicit Google web search about weather routes to search, not the weather resolver', async () => {
