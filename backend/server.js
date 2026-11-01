@@ -1086,6 +1086,18 @@ const limiter = (max) =>
     limit: max,
     standardHeaders: 'draft-7',
     legacyHeaders: false,
+    // Render routes web traffic through Cloudflare. Use Cloudflare's single-IP
+    // client header for the limiter instead of trusting the multi-hop XFF
+    // chain, which can contain a client-supplied prefix. If it is absent or
+    // invalid, fail closed to the socket peer (a shared proxy bucket).
+    ...(TRUST_RENDER_HTTPS
+      ? {
+          keyGenerator: (req) => {
+            const edgeClientIp = req.get('cf-connecting-ip')?.trim();
+            return isIP(edgeClientIp) ? edgeClientIp : req.socket.remoteAddress || 'unknown';
+          },
+        }
+      : {}),
     handler: (req, res) => sendError(res, new HttpError(429, 'rate_limited', 'Too many requests. Please slow down for a moment.')),
   });
 // Applies to every /api request, before authentication, so invalid-token floods are throttled too.

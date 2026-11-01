@@ -917,6 +917,17 @@ test('production refuses weak tokens, HTTP upstreams, and numeric proxy hop coun
   await assert.rejects(startServer({ NODE_ENV: 'production', LUMORA_CLIENT_TOKENS: TOKEN }), (e) => e.code === 1);
   await assert.rejects(startServer({ NODE_ENV: 'production', LUMORA_CLIENT_TOKENS: TOKEN, LLM_BASE_URL: 'https://api.groq.com/openai/v1', TRUST_PROXY: '1' }), (e) => e.code === 1);
   await assert.rejects(startServer({ NODE_ENV: 'production', LUMORA_CLIENT_TOKENS: TOKEN, LLM_BASE_URL: 'https://api.groq.com/openai/v1', TRUST_PROXY: 'render' }), (e) => e.code === 1);
+  await assert.rejects(
+    startServer({
+      NODE_ENV: 'production',
+      LUMORA_CLIENT_TOKENS: TOKEN,
+      LLM_BASE_URL: 'https://api.groq.com/openai/v1',
+      TRUST_PROXY: 'render',
+      RENDER: 'true',
+      RENDER_SERVICE_TYPE: 'worker',
+    }),
+    (e) => e.code === 1,
+  );
 });
 
 test('production HTTPS enforcement accepts only trusted proxy scheme signals', async () => {
@@ -943,7 +954,7 @@ test('production HTTPS enforcement accepts only trusted proxy scheme signals', a
   assert.equal((await fetch(`${render.url}/api/models`, { headers: { 'X-Forwarded-Proto': 'https' } })).status, 401);
 });
 
-test('Render scheme support does not trust spoofed forwarded client IPs', async () => {
+test('Render rate limits fall back to the socket IP for absent or invalid Cloudflare IP headers', async () => {
   const render = await startServer({
     NODE_ENV: 'production',
     LUMORA_CLIENT_TOKENS: TOKEN,
@@ -953,11 +964,59 @@ test('Render scheme support does not trust spoofed forwarded client IPs', async 
     RENDER_SERVICE_TYPE: 'web',
     API_RATE_PER_MIN: '2',
   });
+  const clientIpInputs = [undefined, '', '   ', 'not-an-ip', '2001:db8::not-an-ip'];
   const responses = [];
-  for (let i = 1; i <= 3; i++) {
-    responses.push(await fetch(`${render.url}/api/health`, {
-      headers: { 'X-Forwarded-Proto': 'https', 'X-Forwarded-For': `198.51.100.${i}` },
-    }));
+  for (const [index, clientIp] of clientIpInputs.entries()) {
+    const headers = {
+      'X-Forwarded-Proto': 'https',
+      'X-Forwarded-For': `198.51.100.${index + 1}`,
+    };
+    if (clientIp !== undefined) headers['CF-Connecting-IP'] = clientIp;
+    responses.push(await fetch(`${render.url}/api/health`, { headers }));
   }
+  assert.deepEqual(responses.map((response) => response.status), [200, 200, 429, 429, 429]);
+});
+
+test('Render-only Cloudflare IP keying stays disabled when TRUST_PROXY is not render', async () => {
+  const nonRenderMode = await startServer({
+    LUMORA_CLIENT_TOKENS: TOKEN,
+    RENDER: 'true',
+    RENDER_SERVICE_TYPE: 'web',
+    TRUST_PROXY: '',
+    API_RATE_PER_MIN: '2',
+  });
+  const request = (clientIp) => fetch(`${nonRenderMode.url}/api/health`, {
+    headers: { 'CF-Connecting-IP': clientIp },
+  });
+  const responses = [await request('203.0.113.10'), await request('203.0.113.20'), await request('203.0.113.10')];
   assert.deepEqual(responses.map((response) => response.status), [200, 200, 429]);
+});
+
+test('Render rate limits accept IPv4 and IPv6 client IPs and ignore spoofed X-Forwarded-For', async () => {
+  const render = await startServer({
+    NODE_ENV: 'production',
+    LUMORA_CLIENT_TOKENS: TOKEN,
+    LLM_BASE_URL: 'https://api.groq.com/openai/v1',
+    TRUST_PROXY: 'render',
+    RENDER: 'true',
+    RENDER_SERVICE_TYPE: 'web',
+    API_RATE_PER_MIN: '2',
+  });
+  const request = (clientIp, spoofedIp) => fetch(`${render.url}/api/health`, {
+    headers: {
+      'X-Forwarded-Proto': 'https',
+      'CF-Connecting-IP': clientIp,
+      'X-Forwarded-For': spoofedIp,
+    },
+  });
+
+  const responses = [
+    await request('203.0.113.10', '198.51.100.1'),
+    await request('2001:db8::20', '198.51.100.2'),
+    await request('203.0.113.10', '198.51.100.3'),
+    await request('203.0.113.10', '198.51.100.4'),
+    await request('2001:db8::20', '198.51.100.5'),
+    await request('2001:db8::20', '198.51.100.6'),
+  ];
+  assert.deepEqual(responses.map((response) => response.status), [200, 200, 200, 429, 200, 429]);
 });
