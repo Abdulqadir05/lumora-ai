@@ -255,8 +255,30 @@ function linkedController(parent, timeoutMs) {
 /** fetch() with timeout, cancellation and JSON/text parsing for tool providers. */
 async function fetchData(url, { signal, timeout = LIMITS.toolTimeoutMs, as = 'json', ...init } = {}) {
   const link = linkedController(signal, timeout);
+  let upstreamStatus;
+  const logFailure = (error, { timedOut = false, lumoraCode } = {}) => {
+    let providerHostname = 'unknown';
+    try {
+      providerHostname = new URL(url).hostname;
+    } catch {
+      // Keep malformed provider URLs out of logs.
+    }
+    const safeField = (value) => (typeof value === 'string' && /^[A-Za-z0-9_.-]{1,64}$/.test(value) ? value : undefined);
+    const cause = error instanceof HttpError ? undefined : error?.cause || error;
+    const details = {
+      providerHostname,
+      errorName: safeField(error?.name) || 'Error',
+      ...(Number.isInteger(upstreamStatus) ? { httpStatus: upstreamStatus } : {}),
+      ...(safeField(lumoraCode) ? { lumoraCode: safeField(lumoraCode) } : {}),
+      ...(safeField(cause?.code) ? { causeCode: safeField(cause.code) } : {}),
+      ...(safeField(cause?.name) ? { causeName: safeField(cause.name) } : {}),
+      timedOut,
+    };
+    console.error('[lumora] provider request failed', JSON.stringify(details));
+  };
   try {
     const res = await fetch(url, { ...init, signal: link.ctrl.signal });
+    upstreamStatus = res.status;
     if (res.status === 429) throw new HttpError(503, 'tool_rate_limited', 'Provider rate limit reached — try again in a minute');
     if (!res.ok) throw new HttpError(502, 'tool_http', `Provider responded with HTTP ${res.status}`);
     if (as === 'text') return await res.text();
@@ -266,9 +288,16 @@ async function fetchData(url, { signal, timeout = LIMITS.toolTimeoutMs, as = 'js
       throw new HttpError(502, 'tool_malformed', 'Provider returned malformed data');
     }
   } catch (e) {
-    if (link.state.timedOut) throw new HttpError(504, 'tool_timeout', 'Provider timed out');
+    if (link.state.timedOut) {
+      logFailure(e, { timedOut: true, lumoraCode: 'tool_timeout' });
+      throw new HttpError(504, 'tool_timeout', 'Provider timed out');
+    }
     if (signal?.aborted) throw new HttpError(499, 'aborted', 'Request cancelled.');
-    if (e instanceof HttpError) throw e;
+    if (e instanceof HttpError) {
+      if (e.code !== 'aborted' && e.status !== 499) logFailure(e, { lumoraCode: e.code });
+      throw e;
+    }
+    logFailure(e, { lumoraCode: 'tool_network' });
     throw new HttpError(502, 'tool_network', 'Provider could not be reached');
   } finally {
     link.dispose();

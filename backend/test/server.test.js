@@ -485,6 +485,70 @@ test('weather lookup failures report the failure and never emit a success card o
   assert.doesNotMatch(assistantText, /\b\d+°C|\[1\]/);
 });
 
+test('provider failures log safe diagnostics while preserving public errors', async () => {
+  const { url, child } = await startServer({ LUMORA_CLIENT_TOKENS: TOKEN });
+  const logLines = [];
+  let stderrBuffer = '';
+  const diagnosticsReady = new Promise((resolve) => {
+    const onStderr = (chunk) => {
+      const pieces = (stderrBuffer + chunk.toString()).split('\n');
+      stderrBuffer = pieces.pop();
+      for (const line of pieces) {
+        if (line.includes('[lumora] provider request failed')) logLines.push(line);
+      }
+      if (logLines.length >= 2) {
+        clearTimeout(timer);
+        child.stderr.off('data', onStderr);
+        resolve(logLines.slice(0, 2));
+      }
+    };
+    const timer = setTimeout(() => {
+      child.stderr.off('data', onStderr);
+      resolve(logLines);
+    }, 1500);
+    child.stderr.on('data', onStderr);
+  });
+
+  const networkResponse = await fetch(`${url}/api/tools/weather`, {
+    method: 'POST',
+    headers: auth,
+    body: JSON.stringify({ location: 'NetworkFailureSentinel' }),
+  });
+  const networkError = await networkResponse.json();
+  assert.equal(networkResponse.status, 502);
+  assert.deepEqual(networkError.error, { code: 'tool_network', message: 'Provider could not be reached' });
+
+  const httpResponse = await fetch(`${url}/api/tools/weather`, {
+    method: 'POST',
+    headers: auth,
+    body: JSON.stringify({ location: 'HttpFailureSentinel' }),
+  });
+  const httpError = await httpResponse.json();
+  assert.equal(httpResponse.status, 502);
+  assert.deepEqual(httpError.error, { code: 'tool_http', message: 'Provider responded with HTTP 503' });
+
+  const lines = await diagnosticsReady;
+  const diagnostics = lines.map((line) => JSON.parse(line.slice(line.indexOf('{'))));
+  const network = diagnostics.find((entry) => entry.lumoraCode === 'tool_network');
+  const upstreamHttp = diagnostics.find((entry) => entry.lumoraCode === 'tool_http');
+  assert.deepEqual(network, {
+    providerHostname: 'geocoding-api.open-meteo.com',
+    errorName: 'TypeError',
+    lumoraCode: 'tool_network',
+    causeCode: 'ECONNRESET',
+    causeName: 'Error',
+    timedOut: false,
+  });
+  assert.deepEqual(upstreamHttp, {
+    providerHostname: 'geocoding-api.open-meteo.com',
+    errorName: 'Error',
+    httpStatus: 503,
+    lumoraCode: 'tool_http',
+    timedOut: false,
+  });
+  assert.doesNotMatch(lines.join('\n'), /NetworkFailureSentinel|HttpFailureSentinel|fixture failure detail|fixture response body sentinel|Authorization|Bearer/);
+});
+
 test('an explicit Google web search about weather routes to search, not the weather resolver', async () => {
   const response = await fetch(`${api}/api/chat/stream`, {
     method: 'POST',

@@ -12,6 +12,12 @@ globalThis.fetch = async (input, init) => {
 
   if (url.hostname === 'geocoding-api.open-meteo.com') {
     const name = url.searchParams.get('name') || '';
+    if (name === 'NetworkFailureSentinel') {
+      const cause = Object.assign(new Error('fixture failure detail'), { code: 'ECONNRESET' });
+      const error = new TypeError('fixture network failure detail', { cause });
+      throw error;
+    }
+    if (name === 'HttpFailureSentinel') return new Response('fixture response body sentinel', { status: 503 });
     if (/^(nosuchcity|search on google)$/i.test(name)) return jsonResponse({ results: [] });
     return jsonResponse({
       results: [
