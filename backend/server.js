@@ -533,12 +533,18 @@ function findPriorRequest(users, predicate) {
   return null;
 }
 
+function detectKarat(text) {
+  const matches = [...String(text || '').matchAll(/\b(8|9|10|12|14|16|18|20|21|22|24)\s*(?:k|karat)\b/gi)];
+  const values = [...new Set(matches.map((match) => match[1]))];
+  return values.length === 1 ? `${values[0]}K` : null;
+}
+
 function detectPriceSubject(text) {
   const lower = text.toLowerCase();
-  const karat = text.match(/\b(8|9|10|12|14|16|18|20|21|22|24)\s?karat\b|\b(8|9|10|12|14|16|18|20|21|22|24)\s?k\b/i);
+  const karat = detectKarat(text);
   const location = text.match(/\b(Dubai|Abu Dhabi|UAE|United Arab Emirates|United Kingdom|UK|London|United States|USA|India|Delhi|Mumbai)\b/i)?.[0] || null;
   const metal = /\bgold\b/i.test(text) ? 'gold' : /\bsilver\b/i.test(text) ? 'silver' : null;
-  if (metal) return { kind: metal, label: metal, karat: karat ? `${karat[1] || karat[2]}K` : null, location };
+  if (metal) return { kind: metal, label: metal, karat, location };
   if (/\biphone(?:\s+\d{1,2})?(?:\s+(?:pro|max|plus|air))?\b/i.test(text) && /\b(price|cost|retail|how much)\b/i.test(text)) {
     const product = text.match(/\biPhone(?:\s+\d{1,2})?(?:\s+(?:Pro|Max|Plus|Air))?\b/i)?.[0] || 'iPhone';
     return { kind: 'product', label: product, location };
@@ -916,7 +922,7 @@ function planTools(messages, toolsMode) {
   const previousPriceRequest = findPriorRequest(priorUsers, (text) => !!detectPriceSubject(text));
   const previousWeatherRequest = findPriorRequest(priorUsers, (text) => RX.weather.test(text));
   const previousCommodityRequest = findPriorRequest(priorUsers, (text) => /\b(gold|silver)\b/i.test(text));
-  const latestKarat = last.match(/\b(8|9|10|12|14|16|18|20|21|22|24)\s?(?:k|karat)\b/i)?.[0];
+  const latestKarat = detectKarat(last);
 
   if (explicitPair) {
     plan.currency = explicitPair;
@@ -930,11 +936,14 @@ function planTools(messages, toolsMode) {
     }
   } else if (targetCurrency && followUp) {
     if (previousPriceRequest) {
-      const subject = detectPriceSubject(previousPriceRequest);
+      const previousSubject = detectPriceSubject(previousPriceRequest);
+      const subject = previousSubject?.kind === 'gold' && latestKarat
+        ? { ...previousSubject, karat: latestKarat }
+        : previousSubject;
       const query = buildFreshPriceQuery(previousPriceRequest, subject, last);
       plan.search = { query, topic: 'general', factual: false, explicit: true };
       plan.quoteConversion = { target: targetCurrency, subject, expectedFrom: inferLocationCurrency(previousPriceRequest) };
-      plan.followUpInstruction = `The user wants the prior ${subject?.label || 'price'} converted to ${targetCurrency}. A fresh search was performed. Do not use a prior assistant-generated amount. Convert only if LIVE DATA contains one unambiguous amount, currency, unit, and source date; otherwise explain what is missing.`;
+      plan.followUpInstruction = `The user wants the prior ${subject?.karat ? `${subject.karat} ` : ''}${subject?.label || 'price'} converted to ${targetCurrency}. A fresh search was performed. Do not use a prior assistant-generated amount. Convert only if LIVE DATA contains one unambiguous amount, currency, unit, and source date; otherwise explain what is missing.`;
     } else if (contextualPair) {
       plan.currency = { from: contextualPair.from, to: targetCurrency, amount: 1 };
     } else {

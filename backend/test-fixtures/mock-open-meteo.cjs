@@ -73,10 +73,10 @@ globalThis.fetch = async (input, init) => {
       return jsonResponse({ results: [result] });
     }
     if (/gold/.test(query)) {
-      const karat = /\b24k\b/.test(query) ? '24K' : /\b22k\b/.test(query) ? '22K' : '24K';
+      const karat = /\b24k\b/.test(query) ? '24K' : /\b22k\b/.test(query) ? '22K' : /\b18k\b/.test(query) ? '18K' : '24K';
       const isDubai = /dubai/.test(query);
       const currency = isDubai ? 'AED' : 'USD';
-      const amount = karat === '24K' ? '350' : '300';
+      const amount = karat === '24K' ? '350' : karat === '22K' ? '300' : '250';
       const result = {
         title: `${isDubai ? 'Dubai ' : ''}${karat} gold price today`,
         url: `https://${isDubai ? 'gold-dubai' : 'gold-market'}.example.test/${karat.toLowerCase()}-rate`,
@@ -113,6 +113,11 @@ globalThis.fetch = async (input, init) => {
   }
 
   if (url.hostname === 'open.er-api.com' && /^\/v6\/latest\/[A-Z]{3}$/i.test(url.pathname)) {
+    const observerUrl = process.env.LUMORA_TEST_FX_OBSERVER_URL;
+    if (observerUrl) {
+      const observed = await nativeFetch(observerUrl, { method: 'POST' });
+      if (!observed.ok) throw new Error('Could not record mocked exchange-rate request');
+    }
     if (process.env.MOCK_EXCHANGE_RATE_FAILURE === '1') return new Response('{"result":"error"}', { status: 503, headers: { 'content-type': 'application/json' } });
     const base = url.pathname.split('/').at(-1).toUpperCase();
     const rates = {

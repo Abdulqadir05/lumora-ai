@@ -42,8 +42,13 @@ function mockCompletion(body, last) {
 }
 
 // ─── Mock provider ──────────────────────────────────────────────────────────
-const provider = { calls: [], aborted: 0, port: 0 };
+const provider = { calls: [], aborted: 0, port: 0, fxCalls: 0 };
 const mock = http.createServer((req, res) => {
+  if (req.url === '/__test__/fx-hit' && req.method === 'POST') {
+    provider.fxCalls += 1;
+    res.writeHead(204).end();
+    return;
+  }
   if (req.url.endsWith('/models')) {
     res.setHeader('content-type', 'application/json');
     res.end(JSON.stringify({ data: [{ id: 'openai/gpt-oss-20b' }, { id: 'qwen/qwen3.8-27b' }] }));
@@ -100,7 +105,7 @@ function startServer(env) {
   return new Promise((resolve, reject) => {
     const port = 20000 + Math.floor(Math.random() * 20000);
     const child = spawn(process.execPath, ['--require', WEATHER_MOCK, SERVER], {
-      env: { PATH: process.env.PATH, PORT: String(port), NODE_ENV: 'test', DOTENV_CONFIG_PATH: '/dev/null', TRUST_PROXY: '', LLM_BASE_URL: `http://127.0.0.1:${provider.port}/v1`, LLM_API_KEY: 'sk-secret-test-value', TAVILY_API_KEY: '', ...env },
+      env: { PATH: process.env.PATH, PORT: String(port), NODE_ENV: 'test', DOTENV_CONFIG_PATH: '/dev/null', TRUST_PROXY: '', LLM_BASE_URL: `http://127.0.0.1:${provider.port}/v1`, LLM_API_KEY: 'sk-secret-test-value', TAVILY_API_KEY: '', LUMORA_TEST_FX_OBSERVER_URL: `http://127.0.0.1:${provider.port}/__test__/fx-hit`, ...env },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     children.push(child);
@@ -127,6 +132,22 @@ function parseSSE(text) {
       const [e, d] = b.split('\n');
       return { event: e.slice(7), data: JSON.parse(d.slice(6)) };
     });
+}
+
+async function requestGoldResponse(url, messages, streaming) {
+  const response = await fetch(`${url}/api/chat${streaming ? '/stream' : ''}`, {
+    method: 'POST', headers: auth, body: chatConversationBody(messages),
+  });
+  assert.equal(response.status, 200);
+  if (!streaming) {
+    const result = await response.json();
+    return { content: result.content, meta: result };
+  }
+  const events = parseSSE(await response.text());
+  return {
+    content: events.filter((event) => event.event === 'token').map((event) => event.data.t).join(''),
+    meta: events.find((event) => event.event === 'meta')?.data,
+  };
 }
 
 let api;
@@ -425,6 +446,7 @@ test('gold price follow-up performs a fresh dated search and an authoritative AE
   ];
   try {
     const streamStart = provider.calls.length;
+    const streamFxCallsBefore = provider.fxCalls;
     const streamed = await fetch(`${url}/api/chat/stream`, {
       method: 'POST', headers: auth, body: chatConversationBody(history),
     });
@@ -448,6 +470,8 @@ test('gold price follow-up performs a fresh dated search and an authoritative AE
     assert.equal(fx.data.quoteSourceN, 1);
     assert.equal(fx.data.n, 2);
     assert.equal(fx.data.rateType, 'indicative_midpoint');
+    assert.equal(meta.tools.filter((tool) => tool.type === 'currency').length, 1);
+    assert.equal(provider.fxCalls - streamFxCallsBefore, 1, 'one FX request should serve the verified quote');
     assert.ok(fx.data.providerUpdatedAt);
     assert.ok(fx.data.retrievedAt);
     assert.match(fx.data.calculation, /300 AED per gram × 22\.5 INR\/AED = 6750 INR per gram/);
@@ -462,6 +486,7 @@ test('gold price follow-up performs a fresh dated search and an authoritative AE
     assert.match(streamedText, /\[1\].*\[2\]/s);
 
     const nonStreamStart = provider.calls.length;
+    const nonStreamFxCallsBefore = provider.fxCalls;
     const nonStreamed = await fetch(`${url}/api/chat`, {
       method: 'POST', headers: auth, body: chatConversationBody(history),
     });
@@ -470,10 +495,140 @@ test('gold price follow-up performs a fresh dated search and an authoritative AE
     const nonStreamFx = result.tools.find((tool) => tool.type === 'currency').data;
     assert.equal(nonStreamFx.result, fx.data.result);
     assert.equal(nonStreamFx.unit, fx.data.unit);
+    assert.equal(result.tools.filter((tool) => tool.type === 'currency').length, 1);
+    assert.equal(provider.fxCalls - nonStreamFxCallsBefore, 1, 'non-streaming should also make one FX request');
     assert.deepEqual(result.sources.map((source) => source.n), [1, 2]);
     const nonStreamCall = provider.calls.slice(nonStreamStart).at(-1);
     assert.equal(nonStreamCall.body.stream, false);
     assert.match(nonStreamCall.body.messages[0].content, /Verified calculation: 300 AED per gram/);
+  } finally {
+    child.kill();
+  }
+});
+
+test('gold conversion follow-ups apply an explicit purity, retain location, and scope citations per response', async () => {
+  const { url, child } = await startServer({ LUMORA_CLIENT_TOKENS: TOKEN, TAVILY_API_KEY: TAVILY_TEST_KEY });
+  const original = { role: 'user', content: 'Current gold price in Dubai' };
+  const request = async (messages, streaming) => {
+    const response = await fetch(`${url}/api/chat${streaming ? '/stream' : ''}`, {
+      method: 'POST', headers: auth, body: chatConversationBody(messages),
+    });
+    assert.equal(response.status, 200);
+    if (!streaming) {
+      const result = await response.json();
+      return { content: result.content, meta: result };
+    }
+    const events = parseSSE(await response.text());
+    return {
+      content: events.filter((event) => event.event === 'token').map((event) => event.data.t).join(''),
+      meta: events.find((event) => event.event === 'meta')?.data,
+    };
+  };
+
+  try {
+    const first = await request([original], false);
+    assert.deepEqual(first.meta.sources.map((source) => source.n), [1]);
+
+    for (const item of [
+      { phrase: '22K', karat: '22K', amount: 300, result: 6750, streaming: true },
+      { phrase: '24 karat', karat: '24K', amount: 350, result: 7875, streaming: false },
+      { phrase: '18K', karat: '18K', amount: 250, result: 5625, streaming: true },
+      { phrase: '18 karat', karat: '18K', amount: 250, result: 5625, streaming: false },
+    ]) {
+      const staleAssistant = { role: 'assistant', content: 'Earlier answer mentioned AED 999 per gram [7].' };
+      const history = [original, staleAssistant, { role: 'user', content: `Convert ${item.phrase} to INR` }];
+      const fxCallsBefore = provider.fxCalls;
+      const result = await request(history, item.streaming);
+      const search = result.meta.tools.find((tool) => tool.type === 'search');
+      const fxTools = result.meta.tools.filter((tool) => tool.type === 'currency');
+      const fx = fxTools[0]?.data;
+
+      assert.ok(search);
+      assert.match(search.data.query, new RegExp(`gold ${item.karat}.*Dubai`, 'i'));
+      assert.equal(fxTools.length, 1);
+      assert.equal(fx.from, 'AED');
+      assert.equal(fx.to, 'INR');
+      assert.equal(fx.amount, item.amount);
+      assert.equal(fx.result, item.result);
+      assert.equal(fx.quote.karat, item.karat);
+      assert.equal(fx.quote.label, 'gold');
+      assert.equal(fx.quoteSourceN, 1);
+      assert.equal(fx.n, 2);
+      assert.equal(provider.fxCalls - fxCallsBefore, 1);
+      assert.deepEqual(result.meta.sources.map((source) => source.n), [1, 2], 'each response numbers its own sources from one');
+      assert.equal(result.meta.sources[0].url, search.data.results[0].url);
+      assert.equal(result.meta.sources[1].provider, 'ExchangeRate-API');
+      assert.match(result.content, new RegExp(`${item.amount} AED per gram.*${item.result} INR per gram`, 's'));
+      assert.match(result.content, /\[1\].*\[2\]/s);
+      assert.doesNotMatch(result.content, /\[7\]|999/);
+
+      const currentPrompt = provider.calls.at(-1).body.messages[0].content;
+      assert.match(currentPrompt, /Use citations \[1\] for the quote and \[2\] for the rate/);
+      assert.doesNotMatch(currentPrompt, /\[7\]|999/);
+
+      const alternate = await request(history, !item.streaming);
+      assert.equal(alternate.content, result.content, 'stream and non-stream responses should match');
+      assert.deepEqual(alternate.meta.sources.map((source) => source.n), [1, 2]);
+      assert.equal(provider.fxCalls - fxCallsBefore, 2, 'each separate chat request should make exactly one FX request');
+    }
+
+    const conflictingHistory = [
+      { role: 'user', content: 'Current gold price in Dubai GoldAmbiguousFixture' },
+      { role: 'user', content: 'Convert 22K to INR' },
+    ];
+    const callsBeforeConflict = provider.calls.length;
+    const conflictFxCallsBefore = provider.fxCalls;
+    const conflicting = await requestGoldResponse(url, conflictingHistory, true);
+    const conflictRates = conflicting.meta.tools.filter((tool) => tool.type === 'currency');
+    assert.equal(conflictRates.length, 1);
+    assert.equal(conflictRates[0].data.quote, undefined);
+    assert.equal(conflictRates[0].data.from, 'AED');
+    assert.deepEqual(conflicting.meta.sources.map((source) => source.n), [1, 2, 3]);
+    assert.match(conflicting.content, /22K gold listings conflict.*Which source listing should I use/i);
+    assert.doesNotMatch(conflicting.content, /300 AED|305 AED/);
+    assert.match(conflicting.meta.toolErrors.map((error) => error.message).join('\n'), /conflicting current prices/);
+    assert.equal(provider.fxCalls - conflictFxCallsBefore, 1);
+    assert.equal(provider.calls.length, callsBeforeConflict, 'conflicting quote must bypass Groq');
+
+    const conflictingNonStream = await requestGoldResponse(url, conflictingHistory, false);
+    const normalizeTimestamp = (text) => text.replace(/\(provider updated [^)]+\)/g, '(provider updated timestamp)');
+    assert.equal(normalizeTimestamp(conflictingNonStream.content), normalizeTimestamp(conflicting.content));
+    assert.deepEqual(conflictingNonStream.meta.sources.map((source) => source.n), [1, 2, 3]);
+    assert.equal(provider.fxCalls - conflictFxCallsBefore, 2, 'a separate non-stream request should also make one FX call');
+    assert.equal(provider.calls.length, callsBeforeConflict);
+  } finally {
+    child.kill();
+  }
+});
+
+test('purity omitted from a gold conversion follow-up remains rejected with one rate-only result', async () => {
+  const { url, child } = await startServer({ LUMORA_CLIENT_TOKENS: TOKEN, TAVILY_API_KEY: TAVILY_TEST_KEY });
+  const history = [
+    { role: 'user', content: 'Current gold price in Dubai' },
+    { role: 'assistant', content: 'An earlier answer guessed 24K gold was AED 350 per gram [1].' },
+    { role: 'user', content: 'Convert to INR' },
+  ];
+  try {
+    const callsBefore = provider.calls.length;
+    const streamFxCallsBefore = provider.fxCalls;
+    const streamed = await requestGoldResponse(url, history, true);
+    const streamFx = streamed.meta.tools.filter((tool) => tool.type === 'currency');
+    assert.equal(streamFx.length, 1);
+    assert.equal(streamFx[0].data.quote, undefined);
+    assert.equal(streamFx[0].data.from, 'AED');
+    assert.equal(streamFx[0].data.result, 22.5);
+    assert.equal(provider.fxCalls - streamFxCallsBefore, 1);
+    assert.match(streamed.content, /Which purity should I use—22K, 24K, or another karat/);
+    assert.doesNotMatch(streamed.content, /350 AED|7,875|7875/);
+    assert.equal(provider.calls.length, callsBefore, 'deterministic rejection bypasses Groq');
+
+    const nonStreamFxCallsBefore = provider.fxCalls;
+    const nonStreamed = await requestGoldResponse(url, history, false);
+    const normalizeTimestamp = (text) => text.replace(/\(provider updated [^)]+\)/g, '(provider updated timestamp)');
+    assert.equal(normalizeTimestamp(nonStreamed.content), normalizeTimestamp(streamed.content));
+    assert.equal(nonStreamed.meta.tools.filter((tool) => tool.type === 'currency').length, 1);
+    assert.equal(provider.fxCalls - nonStreamFxCallsBefore, 1);
+    assert.equal(provider.calls.length, callsBefore);
   } finally {
     child.kill();
   }
