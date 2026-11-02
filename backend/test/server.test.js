@@ -17,10 +17,15 @@ const TAVILY_TEST_KEY = 'offline-tavily-test-key';
 
 function mockCompletion(body, last) {
   const system = body.messages.find((message) => message.role === 'system')?.content || '';
+  if (/CLARIFICATION REQUIRED:.*target currency/i.test(system)) return 'Which target currency should I use?';
+  if (/CLARIFICATION REQUIRED:.*amount and source currency/i.test(system)) return 'What amount and source currency should I convert?';
+  const verifiedCalculation = system.match(/Verified calculation: ([^\n]+?)\. Use citations \[(\d+)\] for the quote and \[(\d+)\] for the rate/);
+  if (verifiedCalculation)
+    return `The verified conversion is ${verifiedCalculation[1]} [${verifiedCalculation[2]}], using the indicative midpoint rate [${verifiedCalculation[3]}].`;
   const weatherLine = system.split('\n').find((line) => /^\[\d+\] WEATHER \(/.test(line));
   if (weatherLine) {
     const number = weatherLine.match(/^\[(\d+)\]/)?.[1] || '1';
-    const location = weatherLine.slice(weatherLine.indexOf('local time ') + 11).split('):')[0].split(', ').slice(1).join(', ');
+    const location = weatherLine.match(/retrieved at [^,]+, (.*?)(?:, requested period [^)]*)?\):/)?.[1] || 'unknown location';
     const values = weatherLine.split('): ')[1] || '';
     const temperature = values.match(/^(-?\d+)°C/)?.[1] || 'unknown';
     const description = values.match(/^\S+°C \(feels [^)]+\), ([^,]+),/)?.[1] || 'current conditions';
@@ -107,6 +112,7 @@ function startServer(env) {
 
 const auth = { Authorization: `Bearer ${TOKEN}`, 'Content-Type': 'application/json' };
 const chatBody = (content, extra = {}) => JSON.stringify({ model: 'gpt-oss-20b', messages: [{ role: 'user', content }], ...extra });
+const chatConversationBody = (messages, extra = {}) => JSON.stringify({ model: 'gpt-oss-20b', messages, ...extra });
 
 function parseSSE(text) {
   return text
@@ -307,6 +313,8 @@ test('input validation', async () => {
   assert.equal((await post(JSON.stringify({ location: { $ne: 1 } }), '/api/tools/weather')).status, 400);
   assert.equal((await post(JSON.stringify({ from: 'US', to: 'EUR' }), '/api/tools/currency')).status, 400);
   assert.equal((await post(JSON.stringify({ from: 'USD', to: 'EUR', amount: -5 }), '/api/tools/currency')).status, 400);
+  assert.equal((await post(JSON.stringify({ from: 'ZZZ', to: 'EUR' }), '/api/tools/currency')).status, 400);
+  assert.equal((await post(JSON.stringify({ from: 'USD', to: 'EUR', amount: 0 }), '/api/tools/currency')).status, 400);
   assert.equal((await post(JSON.stringify({ assets: [] }), '/api/tools/crypto')).status, 400);
   assert.equal((await post(JSON.stringify({ query: '' }), '/api/tools/search')).status, 400);
   assert.equal((await post('x'.repeat(300 * 1024))).status, 413);
@@ -367,8 +375,8 @@ test('successful Tavily results reach the Groq streaming context and match numbe
     const call = provider.calls.slice(callStart).at(-1);
     assert.equal(call.body.stream, true);
     const system = call.body.messages[0].content;
-    assert.match(system, /\[1\] Fixture Search Source One — source-one\.example\.test\nFixture search fact one/);
-    assert.match(system, /\[2\] Fixture Search Source Two — source-two\.example\.test\nFixture search fact two/);
+    assert.match(system, /\[1\] SEARCH RESULT \(Tavily, published .* retrieved at .*\): Fixture Search Source One — source-one\.example\.test\. URL: https:\/\/source-one\.example\.test\/search-fact\nFixture search fact one/);
+    assert.match(system, /\[2\] SEARCH RESULT \(Tavily, published .* retrieved at .*\): Fixture Search Source Two — source-two\.example\.test\. URL: https:\/\/source-two\.example\.test\/second-fact\nFixture search fact two/);
     assert.match(system, /WEB SEARCH RESPONSE RULES: Validated live search results are present/);
     assert.match(system, /Never claim that web search or real-time browsing is unavailable while search results are present/);
     assert.match(system, /existing numbered references/);
@@ -395,9 +403,279 @@ test('successful Tavily results reach the Groq non-streaming context', async () 
 
     const call = provider.calls.slice(callStart).at(-1);
     assert.equal(call.body.stream, false);
-    assert.match(call.body.messages[0].content, /\[1\] Fixture Search Source One — source-one\.example\.test\nFixture search fact one/);
-    assert.match(call.body.messages[0].content, /\[2\] Fixture Search Source Two — source-two\.example\.test\nFixture search fact two/);
+    assert.match(call.body.messages[0].content, /\[1\] SEARCH RESULT \(Tavily, published .* retrieved at .*\): Fixture Search Source One — source-one\.example\.test\. URL: https:\/\/source-one\.example\.test\/search-fact\nFixture search fact one/);
+    assert.match(call.body.messages[0].content, /\[2\] SEARCH RESULT \(Tavily, published .* retrieved at .*\): Fixture Search Source Two — source-two\.example\.test\. URL: https:\/\/source-two\.example\.test\/second-fact\nFixture search fact two/);
     assert.match(call.body.messages[0].content, /WEB SEARCH RESPONSE RULES: Validated live search results are present/);
+  } finally {
+    child.kill();
+  }
+});
+
+test('gold price follow-up performs a fresh dated search and an authoritative AED-to-INR calculation', async () => {
+  const { url, child } = await startServer({ LUMORA_CLIENT_TOKENS: TOKEN, TAVILY_API_KEY: TAVILY_TEST_KEY });
+  const history = [
+    { role: 'user', content: 'Search on web current 22K gold price in Dubai' },
+    { role: 'assistant', content: 'Earlier answer guessed AED 999 per gram [1].' },
+    { role: 'user', content: 'Convert in INR' },
+  ];
+  try {
+    const streamStart = provider.calls.length;
+    const streamed = await fetch(`${url}/api/chat/stream`, {
+      method: 'POST', headers: auth, body: chatConversationBody(history),
+    });
+    assert.equal(streamed.status, 200);
+    const events = parseSSE(await streamed.text());
+    const meta = events.find((event) => event.event === 'meta')?.data;
+    const search = meta.tools.find((tool) => tool.type === 'search');
+    const fx = meta.tools.find((tool) => tool.type === 'currency');
+    assert.ok(search);
+    assert.ok(fx);
+    assert.equal(search.data.results[0].n, 1);
+    assert.equal(search.data.results[0].publishedAt, meta.sources[0].publishedAt);
+    assert.ok(search.data.results[0].retrievedAt);
+    assert.equal(fx.data.from, 'AED');
+    assert.equal(fx.data.to, 'INR');
+    assert.equal(fx.data.amount, 300);
+    assert.equal(fx.data.rate, 22.5);
+    assert.equal(fx.data.result, 6750);
+    assert.equal(fx.data.unit, 'per gram');
+    assert.equal(fx.data.quote.karat, '22K');
+    assert.equal(fx.data.quoteSourceN, 1);
+    assert.equal(fx.data.n, 2);
+    assert.equal(fx.data.rateType, 'indicative_midpoint');
+    assert.ok(fx.data.providerUpdatedAt);
+    assert.ok(fx.data.retrievedAt);
+    assert.match(fx.data.calculation, /300 AED per gram × 22\.5 INR\/AED = 6750 INR per gram/);
+    assert.deepEqual(meta.sources.map((source) => source.n), [1, 2]);
+    const streamedCall = provider.calls.slice(streamStart).at(-1);
+    assert.match(streamedCall.body.messages[0].content, /source date .* retrieved at/);
+    assert.match(streamedCall.body.messages[0].content, /indicative midpoint/);
+    assert.match(streamedCall.body.messages[0].content, /Use citations \[1\] for the quote and \[2\] for the rate/);
+    assert.doesNotMatch(streamedCall.body.messages[0].content, /AED 999 per gram/);
+    const streamedText = events.filter((event) => event.event === 'token').map((event) => event.data.t).join('');
+    assert.match(streamedText, /300 AED per gram.*6750 INR per gram/s);
+    assert.match(streamedText, /\[1\].*\[2\]/s);
+
+    const nonStreamStart = provider.calls.length;
+    const nonStreamed = await fetch(`${url}/api/chat`, {
+      method: 'POST', headers: auth, body: chatConversationBody(history),
+    });
+    assert.equal(nonStreamed.status, 200);
+    const result = await nonStreamed.json();
+    const nonStreamFx = result.tools.find((tool) => tool.type === 'currency').data;
+    assert.equal(nonStreamFx.result, fx.data.result);
+    assert.equal(nonStreamFx.unit, fx.data.unit);
+    assert.deepEqual(result.sources.map((source) => source.n), [1, 2]);
+    const nonStreamCall = provider.calls.slice(nonStreamStart).at(-1);
+    assert.equal(nonStreamCall.body.stream, false);
+    assert.match(nonStreamCall.body.messages[0].content, /Verified calculation: 300 AED per gram/);
+  } finally {
+    child.kill();
+  }
+});
+
+test('USD-to-INR context converts 100 dollars; without a known target the assistant asks', async () => {
+  for (const [from, rate] of [['USD', 83.5], ['GBP', 105.5], ['EUR', 90.5]]) {
+    const current = await fetch(`${api}/api/chat/stream`, {
+      method: 'POST', headers: auth, body: chatBody(`What is ${from} to INR today?`),
+    });
+    assert.equal(current.status, 200);
+    const currentMeta = parseSSE(await current.text()).find((event) => event.event === 'meta')?.data;
+    const currentFx = currentMeta.tools.find((tool) => tool.type === 'currency')?.data;
+    assert.equal(currentFx.from, from);
+    assert.equal(currentFx.to, 'INR');
+    assert.equal(currentFx.amount, 1);
+    assert.equal(currentFx.rate, rate);
+  }
+
+  const pairResponse = await fetch(`${api}/api/chat/stream`, {
+    method: 'POST', headers: auth,
+    body: chatConversationBody([
+      { role: 'user', content: 'What is USD to INR today?' },
+      { role: 'assistant', content: 'The current indicative pair was checked.' },
+      { role: 'user', content: 'What about 100 dollars?' },
+    ]),
+  });
+  assert.equal(pairResponse.status, 200);
+  const pairEvents = parseSSE(await pairResponse.text());
+  const pairMeta = pairEvents.find((event) => event.event === 'meta')?.data;
+  const pairFx = pairMeta.tools.find((tool) => tool.type === 'currency')?.data;
+  assert.equal(pairFx.from, 'USD');
+  assert.equal(pairFx.to, 'INR');
+  assert.equal(pairFx.amount, 100);
+  assert.equal(pairFx.result, 8350);
+  assert.equal(pairMeta.tools.some((tool) => tool.type === 'search'), false);
+  assert.match(provider.calls.at(-1).body.messages[0].content, /indicative midpoint/);
+
+  const assistantContext = await fetch(`${api}/api/chat/stream`, {
+    method: 'POST', headers: auth,
+    body: chatConversationBody([
+      { role: 'user', content: 'What was the exchange pair?' },
+      { role: 'assistant', content: 'It was USD to INR, at a guessed 9999 INR per dollar.' },
+      { role: 'user', content: 'What about 100 dollars?' },
+    ]),
+  });
+  const assistantContextEvents = parseSSE(await assistantContext.text());
+  const assistantContextMeta = assistantContextEvents.find((event) => event.event === 'meta')?.data;
+  const assistantContextFx = assistantContextMeta.tools.find((tool) => tool.type === 'currency')?.data;
+  assert.equal(assistantContextFx.from, 'USD');
+  assert.equal(assistantContextFx.to, 'INR');
+  assert.equal(assistantContextFx.amount, 100);
+  assert.equal(assistantContextFx.rate, 83.5);
+  assert.doesNotMatch(provider.calls.at(-1).body.messages[0].content, /9999 INR per dollar/);
+
+  const unclear = await fetch(`${api}/api/chat/stream`, {
+    method: 'POST', headers: auth, body: chatBody('What about 100 dollars?'),
+  });
+  const unclearEvents = parseSSE(await unclear.text());
+  const unclearMeta = unclearEvents.find((event) => event.event === 'meta')?.data;
+  assert.deepEqual(unclearMeta.tools, []);
+  assert.deepEqual(unclearMeta.sources, []);
+  assert.match(unclearEvents.filter((event) => event.event === 'token').map((event) => event.data.t).join(''), /Which target currency/);
+
+  const missingAmount = await fetch(`${api}/api/chat/stream`, {
+    method: 'POST', headers: auth, body: chatBody('Convert in INR'),
+  });
+  const missingAmountEvents = parseSSE(await missingAmount.text());
+  assert.deepEqual(missingAmountEvents.find((event) => event.event === 'meta')?.data.tools, []);
+  assert.match(missingAmountEvents.filter((event) => event.event === 'token').map((event) => event.data.t).join(''), /What amount and source currency/);
+});
+
+test('weather follow-up replaces the city and retains the prior forecast period', async () => {
+  const response = await fetch(`${api}/api/chat/stream`, {
+    method: 'POST', headers: auth,
+    body: chatConversationBody([
+      { role: 'user', content: 'Weather in Dubai tomorrow' },
+      { role: 'assistant', content: 'Tomorrow in Dubai will be clear.' },
+      { role: 'user', content: 'What about Abu Dhabi?' },
+    ]),
+  });
+  assert.equal(response.status, 200);
+  const events = parseSSE(await response.text());
+  const meta = events.find((event) => event.event === 'meta')?.data;
+  const weather = meta.tools.find((tool) => tool.type === 'weather')?.data;
+  assert.ok(weather.location.startsWith('Abu Dhabi'));
+  assert.equal(weather.requestedPeriod, 'tomorrow');
+  assert.equal(weather.requestedForecastDate, weather.daily[1].date);
+  assert.match(provider.calls.at(-1).body.messages[0].content, /requested period tomorrow/);
+  assert.match(provider.calls.at(-1).body.messages[0].content, /Replace the previous location with the newly resolved location/);
+});
+
+test('product price follow-up re-searches and converts only a fresh, explicit amount and item unit', async () => {
+  const { url, child } = await startServer({ LUMORA_CLIENT_TOKENS: TOKEN, TAVILY_API_KEY: TAVILY_TEST_KEY });
+  try {
+    const response = await fetch(`${url}/api/chat/stream`, {
+      method: 'POST', headers: auth,
+      body: chatConversationBody([
+        { role: 'user', content: 'Latest iPhone price in UAE' },
+        { role: 'assistant', content: 'I guessed AED 9,999.' },
+        { role: 'user', content: 'Convert to INR' },
+      ]),
+    });
+    const events = parseSSE(await response.text());
+    const meta = events.find((event) => event.event === 'meta')?.data;
+    const fx = meta.tools.find((tool) => tool.type === 'currency')?.data;
+    assert.equal(fx.from, 'AED');
+    assert.equal(fx.to, 'INR');
+    assert.equal(fx.amount, 3999);
+    assert.equal(fx.unit, 'per item');
+    assert.equal(fx.result, 89977.5);
+    assert.equal(fx.quoteSourceN, 1);
+    assert.equal(fx.n, 2);
+    assert.doesNotMatch(provider.calls.at(-1).body.messages[0].content, /AED 9,999/);
+  } finally {
+    child.kill();
+  }
+});
+
+test('gold karat changes trigger a fresh exact-purity search, never reuse the prior karat quote', async () => {
+  const { url, child } = await startServer({ LUMORA_CLIENT_TOKENS: TOKEN, TAVILY_API_KEY: TAVILY_TEST_KEY });
+  try {
+    const response = await fetch(`${url}/api/chat/stream`, {
+      method: 'POST', headers: auth,
+      body: chatConversationBody([
+        { role: 'user', content: 'Current gold price' },
+        { role: 'assistant', content: 'The 22K quote was AED 300 per gram.' },
+        { role: 'user', content: 'What about 24K?' },
+      ]),
+    });
+    const events = parseSSE(await response.text());
+    const meta = events.find((event) => event.event === 'meta')?.data;
+    const search = meta.tools.find((tool) => tool.type === 'search');
+    assert.ok(search);
+    assert.equal(search.data.results[0].publishedAt != null, true);
+    assert.match(search.data.results[0].snippet, /24K gold/);
+    assert.doesNotMatch(search.data.results[0].snippet, /22K/);
+    assert.equal(meta.tools.some((tool) => tool.type === 'currency'), false);
+    assert.match(provider.calls.at(-1).body.messages[0].content, /fresh search for that purity only/);
+  } finally {
+    child.kill();
+  }
+});
+
+test('stale, undated, and conflicting market prices never create a conversion', async () => {
+  const { url, child } = await startServer({ LUMORA_CLIENT_TOKENS: TOKEN, TAVILY_API_KEY: TAVILY_TEST_KEY });
+  try {
+    for (const [marker, expected] of [
+      ['StaleFixture', /older than 24 hours/],
+      ['UndatedFixture', /undated or older than 24 hours/],
+      ['AmbiguousFixture', /conflicting current prices/],
+      ['NoUnitFixture', /No unambiguous numeric price and unit/],
+    ]) {
+      const response = await fetch(`${url}/api/chat/stream`, {
+        method: 'POST', headers: auth,
+        body: chatConversationBody([
+          { role: 'user', content: `Latest iPhone price in UAE ${marker}` },
+          { role: 'assistant', content: 'An old price was AED 3,000.' },
+          { role: 'user', content: 'Convert to INR' },
+        ]),
+      });
+      assert.equal(response.status, 200);
+      const events = parseSSE(await response.text());
+      const meta = events.find((event) => event.event === 'meta')?.data;
+      assert.equal(meta.tools.some((tool) => tool.type === 'search'), true);
+      assert.equal(meta.tools.some((tool) => tool.type === 'currency'), false);
+      assert.equal(meta.sources.some((source) => source.provider === 'ExchangeRate-API'), false);
+      assert.match(meta.toolErrors.map((error) => error.message).join('\n'), expected);
+    }
+  } finally {
+    child.kill();
+  }
+});
+
+test('Live tools Off suppresses search and currency work for a contextual conversion', async () => {
+  const { url, child } = await startServer({ LUMORA_CLIENT_TOKENS: TOKEN, TAVILY_API_KEY: TAVILY_TEST_KEY });
+  try {
+    const response = await fetch(`${url}/api/chat/stream`, {
+      method: 'POST', headers: auth,
+      body: chatConversationBody([
+        { role: 'user', content: 'Current 22K gold price in Dubai' },
+        { role: 'assistant', content: 'AED 300 per gram.' },
+        { role: 'user', content: 'Convert in INR' },
+      ], { tools: 'off' }),
+    });
+    const events = parseSSE(await response.text());
+    const meta = events.find((event) => event.event === 'meta')?.data;
+    assert.deepEqual(meta.tools, []);
+    assert.deepEqual(meta.sources, []);
+    assert.deepEqual(meta.toolErrors, []);
+    assert.match(provider.calls.at(-1).body.messages[0].content, /LIVE TOOLS DISABLED/);
+  } finally {
+    child.kill();
+  }
+});
+
+test('news requests use one existing news provider rather than duplicating Tavily search', async () => {
+  const { url, child } = await startServer({ LUMORA_CLIENT_TOKENS: TOKEN, TAVILY_API_KEY: TAVILY_TEST_KEY });
+  try {
+    const response = await fetch(`${url}/api/chat/stream`, {
+      method: 'POST', headers: auth, body: chatBody('Latest news about fusion energy'),
+    });
+    assert.equal(response.status, 200);
+    const events = parseSSE(await response.text());
+    const meta = events.find((event) => event.event === 'meta')?.data;
+    assert.deepEqual(meta.tools.map((tool) => tool.type), ['news']);
+    assert.equal(meta.sources[0].provider, 'Google News');
   } finally {
     child.kill();
   }
@@ -538,7 +816,7 @@ test('weather phrasing resolves the city and gives both GPT-OSS and Qwen the sam
 
     const call = provider.calls.at(-1);
     assert.equal(call.body.model, model === 'qwen-3.8-27b' ? 'qwen/qwen3.8-27b' : 'openai/gpt-oss-20b');
-    assert.match(call.body.messages[0].content, /\[1\] WEATHER \(Open-Meteo, local time .*Delhi, Delhi, India\): 28°C/);
+    assert.match(call.body.messages[0].content, /\[1\] WEATHER \(Open-Meteo, observation time .*retrieved at .*Delhi, Delhi, India\): 28°C/);
     assert.match(call.body.messages[0].content, /WEATHER RESPONSE RULES: The server weather result is authoritative/);
     assert.match(call.body.messages[0].content, /Never say that no location was given or that weather was not fetched when a WEATHER record is present/);
   }

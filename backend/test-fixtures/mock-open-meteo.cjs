@@ -30,6 +30,40 @@ globalThis.fetch = async (input, init) => {
     const body = JSON.parse(init.body || '{}');
     if (body.search_depth !== 'basic' || body.max_results < 1 || body.max_results > 8)
       throw new Error('Unexpected Tavily search options');
+    const query = String(body.query || '').toLowerCase();
+    const publishedAt = (ageMs = 60_000) => new Date(Date.now() - ageMs).toISOString();
+    if (/iphone/.test(query)) {
+      const result = {
+        title: 'Latest iPhone price in UAE',
+        url: 'https://shop.example.test/iphone-price',
+        content: /nounit/i.test(query) ? 'iPhone 17 price in UAE: AED 3,999.' : 'iPhone 17 price in UAE: AED 3,999 per item.',
+      };
+      if (!/undated/i.test(query)) result.published_date = /stale/i.test(query) ? publishedAt(48 * 60 * 60 * 1000) : publishedAt();
+      if (/ambiguous/i.test(query)) {
+        const second = { ...result, title: 'Another iPhone price in UAE', url: 'https://other-shop.example.test/iphone-price', content: 'iPhone 17 price in UAE: AED 4,099 per item.' };
+        if (!/undated/i.test(query)) second.published_date = publishedAt();
+        return jsonResponse({ results: [result, second] });
+      }
+      return jsonResponse({ results: [result] });
+    }
+    if (/gold/.test(query)) {
+      const karat = /\b24k\b/.test(query) ? '24K' : /\b22k\b/.test(query) ? '22K' : '24K';
+      const isDubai = /dubai/.test(query);
+      const currency = isDubai ? 'AED' : 'USD';
+      const amount = karat === '24K' ? '350' : '300';
+      const result = {
+        title: `${isDubai ? 'Dubai ' : ''}${karat} gold price today`,
+        url: `https://${isDubai ? 'gold-dubai' : 'gold-market'}.example.test/${karat.toLowerCase()}-rate`,
+        content: `${karat} gold${isDubai ? ' in Dubai' : ''} is ${currency} ${amount} per gram.`,
+      };
+      if (!/undated/i.test(query)) result.published_date = /stale/i.test(query) ? publishedAt(48 * 60 * 60 * 1000) : publishedAt();
+      if (/ambiguous/i.test(query)) {
+        const second = { ...result, title: `Another ${isDubai ? 'Dubai ' : ''}${karat} gold price`, url: 'https://other-gold.example.test/rate', content: `${karat} gold${isDubai ? ' in Dubai' : ''} is ${currency} ${Number(amount) + 5} per gram.` };
+        if (!/undated/i.test(query)) second.published_date = publishedAt();
+        return jsonResponse({ results: [result, second] });
+      }
+      return jsonResponse({ results: [result] });
+    }
     return jsonResponse({
       results: [
         {
@@ -46,6 +80,31 @@ globalThis.fetch = async (input, init) => {
         },
       ],
     });
+  }
+
+  if (url.hostname === 'open.er-api.com' && /^\/v6\/latest\/[A-Z]{3}$/i.test(url.pathname)) {
+    const base = url.pathname.split('/').at(-1).toUpperCase();
+    const rates = {
+      USD: { INR: 83.5, AED: 3.67, GBP: 0.79, EUR: 0.92 },
+      AED: { INR: 22.5, USD: 0.2725, GBP: 0.215, EUR: 0.25 },
+      GBP: { INR: 105.5, USD: 1.27, AED: 4.65, EUR: 1.17 },
+      EUR: { INR: 90.5, USD: 1.09, AED: 4.0, GBP: 0.855 },
+    };
+    return jsonResponse({
+      result: 'success',
+      base_code: base,
+      rates: { [base]: 1, ...(rates[base] || {}) },
+      time_last_update_utc: new Date(Date.now() - 60 * 60 * 1000).toUTCString(),
+      time_next_update_utc: new Date(Date.now() + 23 * 60 * 60 * 1000).toUTCString(),
+    });
+  }
+
+  if (url.hostname === 'news.google.com' && url.pathname.startsWith('/rss')) {
+    const published = new Date().toUTCString();
+    return new Response(
+      `<rss><channel><item><title>Fixture fusion news - Fixture News</title><link>https://news.example.test/fusion</link><source>Fixture News</source><pubDate>${published}</pubDate></item></channel></rss>`,
+      { status: 200, headers: { 'content-type': 'application/rss+xml' } },
+    );
   }
 
   if (url.hostname === 'lumora-weather-relay.abdulqadir04a.workers.dev' && url.pathname === '/geocoding') {
