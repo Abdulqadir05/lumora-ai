@@ -23,6 +23,31 @@ globalThis.fetch = async (input, init) => {
   if ('diagnosticStage' in (init || {})) throw new Error('diagnostic stage must not be forwarded to fetch');
   const url = new URL(typeof input === 'string' || input instanceof URL ? input : input.url);
 
+  if (url.hostname === 'api.tavily.com' && url.pathname === '/search') {
+    if (init?.method !== 'POST') throw new Error('Tavily search requests must use POST');
+    const key = process.env.TAVILY_API_KEY || '';
+    if (!key || init?.headers?.Authorization !== `Bearer ${key}`) throw new Error('Unexpected Tavily request authentication');
+    const body = JSON.parse(init.body || '{}');
+    if (body.search_depth !== 'basic' || body.max_results < 1 || body.max_results > 8)
+      throw new Error('Unexpected Tavily search options');
+    return jsonResponse({
+      results: [
+        {
+          title: 'Fixture Search Source One',
+          url: 'https://source-one.example.test/search-fact',
+          content: 'Fixture search fact one: the example result confirms the first detail.',
+          published_date: '2026-11-01T00:00:00Z',
+        },
+        {
+          title: 'Fixture Search Source Two',
+          url: 'https://source-two.example.test/second-fact',
+          content: 'Fixture search fact two: the second example source provides a separate detail.',
+          published_date: '2026-11-01T00:00:00Z',
+        },
+      ],
+    });
+  }
+
   if (url.hostname === 'lumora-weather-relay.abdulqadir04a.workers.dev' && url.pathname === '/geocoding') {
     if ((init?.method || 'GET') !== 'GET') throw new Error('Weather relay requests must use GET');
     const name = url.searchParams.get('name') || '';

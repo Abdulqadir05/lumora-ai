@@ -13,6 +13,7 @@ import path from 'node:path';
 const SERVER = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'server.js');
 const WEATHER_MOCK = path.join(path.dirname(path.dirname(fileURLToPath(import.meta.url))), 'test-fixtures', 'mock-open-meteo.cjs');
 const TOKEN = '0123456789abcdef0123456789abcdef';
+const TAVILY_TEST_KEY = 'offline-tavily-test-key';
 
 function mockCompletion(body, last) {
   const system = body.messages.find((message) => message.role === 'system')?.content || '';
@@ -335,6 +336,103 @@ test('explicit web-search phrasing routes to search and reports missing configur
     assert.deepEqual(meta.toolErrors, [
       { type: 'search', message: 'Web search could not be retrieved: Web search is not configured on the server.' },
     ], `${content}: missing Tavily configuration should be reported clearly`);
+  }
+});
+
+test('successful Tavily results reach the Groq streaming context and match numbered source metadata', async () => {
+  const { url, child } = await startServer({ LUMORA_CLIENT_TOKENS: TOKEN, TAVILY_API_KEY: TAVILY_TEST_KEY });
+  try {
+    const callStart = provider.calls.length;
+    const response = await fetch(`${url}/api/chat/stream`, {
+      method: 'POST', headers: auth, body: chatBody('Search the web for fixture search facts'),
+    });
+    assert.equal(response.status, 200);
+    const events = parseSSE(await response.text());
+    const meta = events.find((event) => event.event === 'meta')?.data;
+    assert.ok(meta);
+    const search = meta.tools.find((tool) => tool.type === 'search');
+    assert.ok(search);
+    assert.deepEqual(
+      search.data.results.map(({ n, title, url: sourceUrl, domain }) => ({ n, title, url: sourceUrl, domain })),
+      [
+        { n: 1, title: 'Fixture Search Source One', url: 'https://source-one.example.test/search-fact', domain: 'source-one.example.test' },
+        { n: 2, title: 'Fixture Search Source Two', url: 'https://source-two.example.test/second-fact', domain: 'source-two.example.test' },
+      ],
+    );
+    assert.deepEqual(
+      meta.sources.map(({ n, title, url: sourceUrl, domain }) => ({ n, title, url: sourceUrl, domain })),
+      search.data.results.map(({ n, title, url: sourceUrl, domain }) => ({ n, title, url: sourceUrl, domain })),
+    );
+
+    const call = provider.calls.slice(callStart).at(-1);
+    assert.equal(call.body.stream, true);
+    const system = call.body.messages[0].content;
+    assert.match(system, /\[1\] Fixture Search Source One — source-one\.example\.test\nFixture search fact one/);
+    assert.match(system, /\[2\] Fixture Search Source Two — source-two\.example\.test\nFixture search fact two/);
+    assert.match(system, /WEB SEARCH RESPONSE RULES: Validated live search results are present/);
+    assert.match(system, /Never claim that web search or real-time browsing is unavailable while search results are present/);
+    assert.match(system, /existing numbered references/);
+    assert.match(system, /UNTRUSTED WEB CONTENT/);
+  } finally {
+    child.kill();
+  }
+});
+
+test('successful Tavily results reach the Groq non-streaming context', async () => {
+  const { url, child } = await startServer({ LUMORA_CLIENT_TOKENS: TOKEN, TAVILY_API_KEY: TAVILY_TEST_KEY });
+  try {
+    const callStart = provider.calls.length;
+    const response = await fetch(`${url}/api/chat`, {
+      method: 'POST', headers: auth, body: chatBody('Search online for fixture search facts'),
+    });
+    assert.equal(response.status, 200);
+    const result = await response.json();
+    assert.deepEqual(result.sources.map(({ n, title, url: sourceUrl }) => ({ n, title, url: sourceUrl })), [
+      { n: 1, title: 'Fixture Search Source One', url: 'https://source-one.example.test/search-fact' },
+      { n: 2, title: 'Fixture Search Source Two', url: 'https://source-two.example.test/second-fact' },
+    ]);
+    assert.deepEqual(result.tools.find((tool) => tool.type === 'search').data.results.map((entry) => entry.n), [1, 2]);
+
+    const call = provider.calls.slice(callStart).at(-1);
+    assert.equal(call.body.stream, false);
+    assert.match(call.body.messages[0].content, /\[1\] Fixture Search Source One — source-one\.example\.test\nFixture search fact one/);
+    assert.match(call.body.messages[0].content, /\[2\] Fixture Search Source Two — source-two\.example\.test\nFixture search fact two/);
+    assert.match(call.body.messages[0].content, /WEB SEARCH RESPONSE RULES: Validated live search results are present/);
+  } finally {
+    child.kill();
+  }
+});
+
+test('failed or disabled search is disclosed without inventing successful results', async () => {
+  const failedStart = provider.calls.length;
+  const failedResponse = await fetch(`${api}/api/chat/stream`, {
+    method: 'POST', headers: auth, body: chatBody('Search the web for fixture search facts'),
+  });
+  const failedEvents = parseSSE(await failedResponse.text());
+  const failedMeta = failedEvents.find((event) => event.event === 'meta')?.data;
+  assert.deepEqual(failedMeta?.sources, []);
+  assert.deepEqual(failedMeta?.tools, []);
+  assert.equal(failedMeta?.toolErrors?.[0]?.type, 'search');
+  const failedSystem = provider.calls.slice(failedStart).at(-1).body.messages[0].content;
+  assert.match(failedSystem, /WEB SEARCH RESPONSE RULES: No validated live search results are available because the search request failed/);
+  assert.doesNotMatch(failedSystem, /Fixture Search Source One|Fixture search fact one/);
+
+  const { url, child } = await startServer({ LUMORA_CLIENT_TOKENS: TOKEN, TAVILY_API_KEY: TAVILY_TEST_KEY });
+  try {
+    const disabledStart = provider.calls.length;
+    const disabledResponse = await fetch(`${url}/api/chat/stream`, {
+      method: 'POST', headers: auth, body: chatBody('Search the web for fixture search facts', { tools: 'off' }),
+    });
+    const disabledEvents = parseSSE(await disabledResponse.text());
+    const disabledMeta = disabledEvents.find((event) => event.event === 'meta')?.data;
+    assert.deepEqual(disabledMeta?.sources, []);
+    assert.deepEqual(disabledMeta?.tools, []);
+    assert.deepEqual(disabledMeta?.toolErrors, []);
+    const disabledSystem = provider.calls.slice(disabledStart).at(-1).body.messages[0].content;
+    assert.match(disabledSystem, /WEB SEARCH RESPONSE RULES: The user requested web search, but Live tools are disabled/);
+    assert.doesNotMatch(disabledSystem, /Fixture Search Source One|Fixture search fact one/);
+  } finally {
+    child.kill();
   }
 });
 
