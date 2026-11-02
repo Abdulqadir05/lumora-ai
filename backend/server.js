@@ -555,6 +555,31 @@ function inferLocationCurrency(text) {
   return null;
 }
 
+function reportedPriceCurrency(results, preferred) {
+  if (FX_CODES.has(preferred)) return preferred;
+  const currencies = new Set();
+  const codes = `(?:${[...FX_CODES].sort((a, b) => b.length - a.length).join('|')})`;
+  const amount = '(?:\\d{1,3}(?:,\\d{3})+|\\d+)(?:\\.\\d{1,2})?';
+  const codePatterns = [new RegExp(`\\b(${codes})\\s*${amount}\\b`, 'gi'), new RegExp(`\\b${amount}\\s*(${codes})\\b`, 'gi')];
+  for (const result of results || []) {
+    const text = `${result.title || ''} ${result.snippet || ''}`;
+    for (const pattern of codePatterns) {
+      for (const match of text.matchAll(pattern)) {
+        const token = match[1] || match[2];
+        const code = normalizeCurrencyToken(token);
+        if (FX_CODES.has(code)) currencies.add(code);
+      }
+    }
+    for (const match of text.matchAll(/([₹$£€])\s*(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d{1,2})?/g)) {
+      if (match[1] === '₹') currencies.add('INR');
+      else if (match[1] === '€') currencies.add('EUR');
+      else if (match[1] === '£') currencies.add('GBP');
+      else if (match[1] === '$' && inferLocationCurrency(text) === 'USD') currencies.add('USD');
+    }
+  }
+  return currencies.size === 1 ? [...currencies][0] : null;
+}
+
 function extractFollowUpCity(text) {
   const m = text.match(/^\s*(?:what\s+about|how\s+about|and\s+(?:in|at|for)?|instead\s+in)\s+(.+?)[?.!,;]*\s*$/i);
   if (!m) return null;
@@ -1275,6 +1300,45 @@ async function getWikipedia(query, signal) {
 
 const TOOL_LABEL = { weather: 'Live weather', currency: 'Exchange rates', crypto: 'Crypto market data', news: 'News', search: 'Web search' };
 
+function safeExchangeRateFailure(error) {
+  return error instanceof HttpError && error.status < 500 ? error.message : 'the exchange-rate provider could not be reached';
+}
+
+function rejectedQuoteResponse(subject, target, reason, rateData, rateError, sourceCurrency) {
+  const lowerReason = String(reason || '').toLowerCase();
+  let message;
+  if ((subject?.kind === 'gold' || subject?.kind === 'silver') && !subject.karat) {
+    message = `I can't verify this ${subject.kind} conversion without its purity. Which purity should I use—22K, 24K, or another karat?`;
+  } else if (subject?.kind === 'gold' || subject?.kind === 'silver') {
+    message = /conflict|ambiguous/i.test(lowerReason)
+      ? `The current ${subject.karat || ''} ${subject.kind} listings conflict. Which source listing should I use before converting?`
+      : `I couldn't verify a current ${subject.karat || ''} ${subject.kind} quote. ${reason}`;
+  } else if (subject?.kind === 'product') {
+    const product = subject.label && subject.label !== 'iphone' ? subject.label : 'requested iPhone model';
+    message = /conflict/i.test(lowerReason)
+      ? `The current listings for ${product} conflict. Which source listing should I use before converting?`
+      : `I couldn't verify a price clearly tied to the ${product}. Please choose or share a current listing that names the exact model beside its price.`;
+  } else {
+    message = `I couldn't verify a quote for this conversion. ${reason || 'A current, unambiguous price is required.'}`;
+  }
+
+  if (rateData) {
+    const updated = rateData.providerUpdatedAt ? ` (provider updated ${rateData.providerUpdatedAt})` : '';
+    message += ` ExchangeRate-API reports an indicative midpoint rate of 1 ${rateData.from} = ${rateData.rate} ${rateData.to}${updated} [${rateData.n}]. No converted price was calculated without a verified quote.`;
+  } else if (rateError) {
+    message += ` The ${sourceCurrency || 'source'} → ${target} exchange-rate lookup also failed, so no conversion was calculated.`;
+  } else if (!sourceCurrency) {
+    message += ' I could not identify one source currency clearly enough to request an exchange rate.';
+  }
+  return message;
+}
+
+function quoteRateFailureResponse(quote, target, error) {
+  const sourceReference = Number.isInteger(quote.sourceNumber) ? ` [${quote.sourceNumber}]` : '';
+  const updated = quote.publishedAt ? ` (source date ${quote.publishedAt})` : '';
+  return `The source lists ${quote.displayPrice || `${quote.amount} ${quote.currency}`} for ${quote.label}${updated}${sourceReference}, but ExchangeRate-API could not retrieve the ${quote.currency} → ${target} rate. No conversion was calculated.`;
+}
+
 /** Runs planned tools in parallel and returns normalized cards, numbered sources and errors. */
 async function runTools(plan, signal, onStatus) {
   const jobs = [];
@@ -1362,32 +1426,72 @@ async function runTools(plan, signal, onStatus) {
     tools.push({ type, data });
   });
 
+  let responseOverride = null;
   if (plan.quoteConversion) {
     const searchData = tools.find((tool) => tool.type === 'search')?.data;
-    if (searchData) {
-      const extracted = extractVerifiedPriceQuote(searchData.results, plan.quoteConversion);
-      if (!extracted.quote) {
-        errors.push({ type: 'currency', message: extracted.reason });
-      } else {
-        try {
+    const sourceCurrency = reportedPriceCurrency(searchData?.results, plan.quoteConversion.expectedFrom);
+    let rateData = null;
+    let rateError = null;
+    const addRateTool = (data) => {
+      data.n = addSource(`${TOOL_LABEL.currency} — ${data.provider}`, data.providerUrl, hostOf(data.providerUrl), {
+        provider: data.provider, providerUpdatedAt: data.providerUpdatedAt, retrievedAt: data.retrievedAt,
+      });
+      tools.push({ type: 'currency', data });
+      return data;
+    };
+    const rateErrorMessage = (error, from) => {
+      const safe = safeExchangeRateFailure(error);
+      return `Exchange rates could not be retrieved${from ? ` for ${from} → ${plan.quoteConversion.target}` : ''}: ${safe}. No conversion was calculated.`;
+    };
+
+    // Resolve and fetch an exchange rate independently of quote acceptance.
+    if (sourceCurrency) {
+      try {
+        onStatus?.('Fetching exchange rates…');
+        rateData = addRateTool(await getCurrency({ from: sourceCurrency, to: plan.quoteConversion.target, amount: 1 }, signal));
+      } catch (error) {
+        if (error?.code === 'aborted' || signal?.aborted) throw error;
+        rateError = error;
+        errors.push({ type: 'currency', message: rateErrorMessage(error, sourceCurrency) });
+      }
+    }
+
+    const extracted = searchData
+      ? extractVerifiedPriceQuote(searchData.results, plan.quoteConversion)
+      : { quote: null, reason: 'No fresh search results were available to verify the requested quote.' };
+    if (!extracted.quote) {
+      errors.push({ type: 'currency', message: extracted.reason });
+      responseOverride = rejectedQuoteResponse(plan.quoteConversion.subject, plan.quoteConversion.target, extracted.reason, rateData, rateError, sourceCurrency);
+    } else {
+      const quote = extracted.quote;
+      try {
+        if (!rateData && !rateError) {
+          // A verified quote can establish a source currency when the request
+          // and search text did not identify one unambiguously beforehand.
           onStatus?.('Fetching exchange rates…');
-          const quote = extracted.quote;
-          const converted = await getCurrency({ from: quote.currency, to: plan.quoteConversion.target, amount: quote.amount }, signal);
-          if (signal?.aborted) throw new HttpError(499, 'aborted', 'Request cancelled.');
-          converted.kind = quote.kind;
-          converted.unit = quote.unit;
-          converted.quote = quote;
-          converted.quoteSourceN = quote.sourceNumber;
-          converted.calculation = `${quote.amount} ${quote.currency} ${quote.unit} × ${converted.rate} ${converted.to}/${converted.from} = ${converted.result} ${converted.to} ${quote.unit}`;
-          converted.n = addSource(`${TOOL_LABEL.currency} — ${converted.provider}`, converted.providerUrl, hostOf(converted.providerUrl), {
-            provider: converted.provider, providerUpdatedAt: converted.providerUpdatedAt, retrievedAt: converted.retrievedAt,
-          });
-          tools.push({ type: 'currency', data: converted });
-        } catch (error) {
-          if (error?.code === 'aborted' || signal?.aborted) throw error;
-          const safe = error instanceof HttpError && error.status < 500 ? error.message : 'the exchange-rate provider could not be reached';
-          errors.push({ type: 'currency', message: `Exchange rates could not be retrieved: ${safe}. No conversion was calculated.` });
+          rateData = addRateTool(await getCurrency({ from: quote.currency, to: plan.quoteConversion.target, amount: 1 }, signal));
         }
+        if (signal?.aborted) throw new HttpError(499, 'aborted', 'Request cancelled.');
+        if (rateError) {
+          responseOverride = quoteRateFailureResponse(quote, plan.quoteConversion.target, rateError);
+        } else if (rateData.from !== quote.currency || rateData.to !== plan.quoteConversion.target) {
+          throw new HttpError(502, 'rate_unavailable', 'The retrieved exchange rate does not match the verified quote currency.');
+        } else {
+          rateData.amount = quote.amount;
+          rateData.result = Math.round(quote.amount * rateData.rate * 10000) / 10000;
+          rateData.kind = quote.kind;
+          rateData.unit = quote.unit;
+          rateData.quote = quote;
+          rateData.quoteSourceN = quote.sourceNumber;
+          rateData.calculation = `${quote.amount} ${quote.currency} ${quote.unit} × ${rateData.rate} ${rateData.to}/${rateData.from} = ${rateData.result} ${rateData.to} ${quote.unit}`;
+        }
+      } catch (error) {
+        if (error?.code === 'aborted' || signal?.aborted) throw error;
+        if (!rateError) {
+          rateError = error;
+          errors.push({ type: 'currency', message: rateErrorMessage(error, quote.currency) });
+        }
+        responseOverride = quoteRateFailureResponse(quote, plan.quoteConversion.target, rateError);
       }
     }
   }
@@ -1395,7 +1499,7 @@ async function runTools(plan, signal, onStatus) {
   return {
     tools, sources, toolErrors: errors, attempted: true, searchDisabled: plan.searchDisabled === true,
     toolsDisabled: plan.toolsDisabled === true, clarification: plan.clarification || null,
-    followUpInstruction: plan.followUpInstruction || null,
+    followUpInstruction: plan.followUpInstruction || null, quoteConversion: !!plan.quoteConversion, responseOverride,
   };
 }
 
@@ -1426,6 +1530,7 @@ function toolContext(live) {
     } else if (type === 'news') {
       data.articles.forEach((a) => a.n && blocks.push(`[${a.n}] NEWS (${data.provider}, published ${a.publishedAt || 'date not provided'}, retrieved at ${data.retrievedAt}): ${a.title} — ${a.source}. URL: ${a.url}`));
     } else if (type === 'search') {
+      if (live.quoteConversion) continue;
       data.results.forEach((r) => r.n && blocks.push(`[${r.n}] SEARCH RESULT (${data.provider}, published ${r.publishedAt || 'date not provided'}, retrieved at ${r.retrievedAt || data.retrievedAt}): ${r.title} — ${r.domain}. URL: ${r.url}\n${r.snippet}`));
     }
   }
@@ -1473,7 +1578,7 @@ function buildSystemPrompt(live, timezone, model) {
   }
   if (live.tools.some((tool) => tool.type === 'currency'))
     parts.push('CURRENCY RESPONSE RULES: Label ExchangeRate-API values as indicative midpoint rates; they are not guaranteed bank, cash-exchange, or transaction rates. For a verified quote conversion, reproduce the source-form price exactly, state the parsed amount and per-item unit, the rate and the backend calculation, and cite both the quote source and exchange-rate source. Do not change the source amount or recalculate from prior assistant text.');
-  const hasSearchResults = live.tools.some((tool) => tool.type === 'search' && Array.isArray(tool.data?.results) && tool.data.results.length > 0);
+  const hasSearchResults = !live.quoteConversion && live.tools.some((tool) => tool.type === 'search' && Array.isArray(tool.data?.results) && tool.data.results.length > 0);
   const searchFailed = live.toolErrors.some((error) => error.type === 'search');
   if (hasSearchResults) {
     parts.push(
@@ -1655,6 +1760,12 @@ app.post('/api/chat', chatLimiter, asyncRoute(async (req, res) => {
   const ctrl = new AbortController();
   res.on('close', () => !res.writableEnded && ctrl.abort());
   const live = await runTools(planTools(input.messages, input.toolsMode), ctrl.signal);
+  if (live.responseOverride) {
+    return res.json({
+      id: crypto.randomUUID(), model: { id: model.id, label: model.label }, content: live.responseOverride,
+      finishReason: 'stop', usage: null, sources: live.sources, tools: live.tools, toolErrors: live.toolErrors,
+    });
+  }
   const { res: upstream, link } = await openProvider(providerBody(model, input.messages, live, input.timezone, false), ctrl.signal);
   let data;
   try {
@@ -1723,7 +1834,12 @@ app.post('/api/chat/stream', chatLimiter, async (req, res) => {
       tools: live.tools,
       toolErrors: live.toolErrors,
     });
-    send('status', { stage: 'thinking', label: `${model.label} is thinking…` });
+    send('status', { stage: 'thinking', label: live.responseOverride ? 'Preparing a verified response…' : `${model.label} is thinking…` });
+    if (live.responseOverride) {
+      send('token', { t: live.responseOverride });
+      send('done', { requestId, finishReason: 'stop', usage: null });
+      return;
+    }
 
     const opened = await openProvider(providerBody(model, input.messages, live, input.timezone, true), ctrl.signal);
     link = opened.link;

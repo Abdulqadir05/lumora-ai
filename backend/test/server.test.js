@@ -479,8 +479,8 @@ test('gold price follow-up performs a fresh dated search and an authoritative AE
   }
 });
 
-test('USD-to-INR context converts 100 dollars; without a known target the assistant asks', async () => {
-  for (const [from, rate] of [['USD', 83.5], ['GBP', 105.5], ['EUR', 90.5]]) {
+test('currency routing retrieves AED, USD, GBP, and EUR rates to INR', async () => {
+  for (const [from, rate] of [['AED', 22.5], ['USD', 83.5], ['GBP', 105.5], ['EUR', 90.5]]) {
     const current = await fetch(`${api}/api/chat/stream`, {
       method: 'POST', headers: auth, body: chatBody(`What is ${from} to INR today?`),
     });
@@ -544,6 +544,127 @@ test('USD-to-INR context converts 100 dollars; without a known target the assist
   const missingAmountEvents = parseSSE(await missingAmount.text());
   assert.deepEqual(missingAmountEvents.find((event) => event.event === 'meta')?.data.tools, []);
   assert.match(missingAmountEvents.filter((event) => event.event === 'token').map((event) => event.data.t).join(''), /What amount and source currency/);
+});
+
+test('missing gold purity rejects the search amount but independently returns the USD-to-INR rate', async () => {
+  const { url, child } = await startServer({ LUMORA_CLIENT_TOKENS: TOKEN, TAVILY_API_KEY: TAVILY_TEST_KEY });
+  const history = [
+    { role: 'user', content: 'Search current gold price in USA MissingPurityFixture' },
+    { role: 'assistant', content: 'The earlier search showed USD 61.70 for 24K gold.' },
+    { role: 'user', content: 'Convert in INR' },
+  ];
+  const callsBefore = provider.calls.length;
+  try {
+    const response = await fetch(`${url}/api/chat/stream`, { method: 'POST', headers: auth, body: chatConversationBody(history) });
+    assert.equal(response.status, 200);
+    const events = parseSSE(await response.text());
+    const meta = events.find((event) => event.event === 'meta')?.data;
+    const fx = meta.tools.find((tool) => tool.type === 'currency')?.data;
+    const content = events.filter((event) => event.event === 'token').map((event) => event.data.t).join('');
+    assert.ok(meta.tools.some((tool) => tool.type === 'search'));
+    assert.ok(fx);
+    assert.equal(fx.from, 'USD');
+    assert.equal(fx.to, 'INR');
+    assert.equal(fx.rate, 83.5);
+    assert.equal(fx.quote, undefined);
+    assert.match(content, /Which purity should I use—22K, 24K, or another karat/);
+    assert.match(content, /1 USD = 83\.5 INR/);
+    assert.match(content, /provider updated .*\[\d+\]/);
+    assert.doesNotMatch(content, /61\.70|24K gold price was USD/i);
+    assert.match(meta.toolErrors.map((error) => error.message).join('\n'), /Gold purity was not specified/);
+    assert.equal(provider.calls.length, callsBefore, 'rejected quote must bypass Groq generation');
+  } finally {
+    child.kill();
+  }
+});
+
+test('ambiguous current gold quotes ask the user to choose and never expose candidate amounts to Groq', async () => {
+  const { url, child } = await startServer({ LUMORA_CLIENT_TOKENS: TOKEN, TAVILY_API_KEY: TAVILY_TEST_KEY });
+  const history = [
+    { role: 'user', content: 'Search current 22K gold price in Dubai GoldAmbiguousFixture' },
+    { role: 'user', content: 'Convert in INR' },
+  ];
+  const callsBefore = provider.calls.length;
+  try {
+    const response = await fetch(`${url}/api/chat/stream`, { method: 'POST', headers: auth, body: chatConversationBody(history) });
+    const events = parseSSE(await response.text());
+    const meta = events.find((event) => event.event === 'meta')?.data;
+    const fx = meta.tools.find((tool) => tool.type === 'currency')?.data;
+    const content = events.filter((event) => event.event === 'token').map((event) => event.data.t).join('');
+    assert.equal(response.status, 200);
+    assert.ok(fx);
+    assert.equal(fx.from, 'AED');
+    assert.equal(fx.rate, 22.5);
+    assert.equal(fx.quote, undefined);
+    assert.match(content, /listings conflict.*Which source listing should I use/i);
+    assert.match(content, /1 AED = 22\.5 INR/);
+    assert.doesNotMatch(content, /300 AED|305 AED/);
+    assert.equal(meta.sources.length, 3);
+    assert.equal(provider.calls.length, callsBefore);
+  } finally {
+    child.kill();
+  }
+});
+
+test('rejected iPhone price stays out of the model while AED-to-INR retrieval succeeds', async () => {
+  const { url, child } = await startServer({ LUMORA_CLIENT_TOKENS: TOKEN, TAVILY_API_KEY: TAVILY_TEST_KEY });
+  const history = [
+    { role: 'user', content: 'Latest iPhone 17 Pro price in UAE RejectedProductQuoteFixture' },
+    { role: 'assistant', content: 'An earlier answer guessed AED 5,349.' },
+    { role: 'user', content: 'Convert to INR' },
+  ];
+  const callsBefore = provider.calls.length;
+  try {
+    const response = await fetch(`${url}/api/chat/stream`, { method: 'POST', headers: auth, body: chatConversationBody(history) });
+    const events = parseSSE(await response.text());
+    const meta = events.find((event) => event.event === 'meta')?.data;
+    const fx = meta.tools.find((tool) => tool.type === 'currency')?.data;
+    const content = events.filter((event) => event.event === 'token').map((event) => event.data.t).join('');
+    assert.equal(response.status, 200);
+    assert.ok(fx);
+    assert.equal(fx.from, 'AED');
+    assert.equal(fx.to, 'INR');
+    assert.equal(fx.rate, 22.5);
+    assert.equal(fx.quote, undefined);
+    assert.match(content, /Please choose or share a current listing that names the exact model beside its price/);
+    assert.match(content, /1 AED = 22\.5 INR/);
+    assert.doesNotMatch(content, /5,349|5349/);
+    assert.match(meta.toolErrors.map((error) => error.message).join('\n'), /does not clearly associate that price/);
+    assert.equal(meta.sources.length, 2);
+    assert.equal(provider.calls.length, callsBefore, 'rejected price and its snippets must not reach Groq');
+  } finally {
+    child.kill();
+  }
+});
+
+test('quote rejection is identical for streaming and non-streaming when the FX lookup fails', async () => {
+  const { url, child } = await startServer({
+    LUMORA_CLIENT_TOKENS: TOKEN, TAVILY_API_KEY: TAVILY_TEST_KEY, MOCK_EXCHANGE_RATE_FAILURE: '1',
+  });
+  const history = [
+    { role: 'user', content: 'Latest iPhone 17 Pro price in UAE RejectedProductQuoteFixture' },
+    { role: 'user', content: 'Convert to INR' },
+  ];
+  const callsBefore = provider.calls.length;
+  try {
+    const streamed = await fetch(`${url}/api/chat/stream`, { method: 'POST', headers: auth, body: chatConversationBody(history) });
+    const streamEvents = parseSSE(await streamed.text());
+    const streamMeta = streamEvents.find((event) => event.event === 'meta')?.data;
+    const streamContent = streamEvents.filter((event) => event.event === 'token').map((event) => event.data.t).join('');
+    const nonStreamed = await fetch(`${url}/api/chat`, { method: 'POST', headers: auth, body: chatConversationBody(history) });
+    const nonStream = await nonStreamed.json();
+    assert.equal(streamed.status, 200);
+    assert.equal(nonStreamed.status, 200);
+    assert.equal(streamContent, nonStream.content);
+    assert.equal(streamMeta.tools.some((tool) => tool.type === 'currency'), false);
+    assert.equal(nonStream.tools.some((tool) => tool.type === 'currency'), false);
+    assert.match(streamContent, /AED → INR exchange-rate lookup also failed/);
+    assert.doesNotMatch(streamContent, /5,349|5349|22\.5|83\.5|provider updated|2026-/);
+    assert.match(streamMeta.toolErrors.map((error) => error.message).join('\n'), /Exchange rates could not be retrieved for AED → INR/);
+    assert.equal(provider.calls.length, callsBefore);
+  } finally {
+    child.kill();
+  }
 });
 
 test('weather follow-up replaces the city and retains the prior forecast period', async () => {
@@ -633,6 +754,7 @@ test('stale, undated, and conflicting market prices never create a conversion', 
       ['UndatedFixture', /undated or older than 24 hours/],
       ['AmbiguousFixture', /conflicting current product prices/],
     ]) {
+      const callsBefore = provider.calls.length;
       const response = await fetch(`${url}/api/chat/stream`, {
         method: 'POST', headers: auth,
         body: chatConversationBody([
@@ -645,9 +767,18 @@ test('stale, undated, and conflicting market prices never create a conversion', 
       const events = parseSSE(await response.text());
       const meta = events.find((event) => event.event === 'meta')?.data;
       assert.equal(meta.tools.some((tool) => tool.type === 'search'), true);
-      assert.equal(meta.tools.some((tool) => tool.type === 'currency'), false);
-      assert.equal(meta.sources.some((source) => source.provider === 'ExchangeRate-API'), false);
+      const rateOnly = meta.tools.find((tool) => tool.type === 'currency')?.data;
+      assert.ok(rateOnly, marker);
+      assert.equal(rateOnly.from, 'AED', marker);
+      assert.equal(rateOnly.to, 'INR', marker);
+      assert.equal(rateOnly.amount, 1, marker);
+      assert.equal(rateOnly.quote, undefined, marker);
+      assert.equal(meta.sources.some((source) => source.provider === 'ExchangeRate-API'), true, marker);
       assert.match(meta.toolErrors.map((error) => error.message).join('\n'), expected);
+      const answer = events.filter((event) => event.event === 'token').map((event) => event.data.t).join('');
+      assert.doesNotMatch(answer, /AED 4,699|AED 4,099|3,000/);
+      assert.equal(provider.calls.length, callsBefore, `${marker}: rejected quote must bypass Groq`);
+      if (marker === 'AmbiguousFixture') assert.match(answer, /Which source listing should I use/);
     }
   } finally {
     child.kill();
@@ -739,6 +870,7 @@ test('product-price validation excludes shipping, discounts without final prices
       ['DiscountFixture', 'UAE', 'INR', /No unambiguous numeric product price and currency/],
     ]) {
       const locationText = location ? ` in ${location}` : '';
+      const callsBefore = provider.calls.length;
       const response = await fetch(`${url}/api/chat/stream`, {
         method: 'POST', headers: auth,
         body: chatConversationBody([
@@ -750,16 +882,25 @@ test('product-price validation excludes shipping, discounts without final prices
       const events = parseSSE(await response.text());
       const meta = events.find((event) => event.event === 'meta')?.data;
       assert.ok(meta.tools.some((tool) => tool.type === 'search'), marker);
-      assert.equal(meta.tools.some((tool) => tool.type === 'currency'), false, marker);
-      assert.equal(meta.sources.some((source) => source.provider === 'ExchangeRate-API'), false, marker);
+      const rateOnly = meta.tools.find((tool) => tool.type === 'currency')?.data;
+      if (location) {
+        assert.ok(rateOnly, marker);
+        assert.equal(rateOnly.from, 'AED', marker);
+        assert.equal(rateOnly.to, target, marker);
+        assert.equal(rateOnly.quote, undefined, marker);
+        assert.equal(meta.sources.some((source) => source.provider === 'ExchangeRate-API'), true, marker);
+      } else {
+        assert.equal(rateOnly, undefined, marker);
+        assert.equal(meta.sources.some((source) => source.provider === 'ExchangeRate-API'), false, marker);
+      }
       assert.match(meta.toolErrors.map((error) => error.message).join('\n'), expectedError, marker);
-      assert.doesNotMatch(provider.calls.at(-1).body.messages[0].content, /Verified calculation:/, marker);
+      const answer = events.filter((event) => event.event === 'token').map((event) => event.data.t).join('');
+      assert.equal(provider.calls.length, callsBefore, `${marker}: rejected quote must bypass Groq`);
       if (marker === 'ConflictingFixture') {
-        assert.deepEqual(meta.sources.map((source) => source.url), [
+        assert.deepEqual(meta.sources.slice(0, 2).map((source) => source.url), [
           'https://shop.example.test/iphone-price',
           'https://other-retailer.example.test/iphone-price',
         ]);
-        const answer = events.filter((event) => event.event === 'token').map((event) => event.data.t).join('');
         assert.match(answer, /Which source listing should I use/);
       }
     }
@@ -807,11 +948,16 @@ test('product prices stay associated with their iPhone model in mixed and multi-
 
     const titleOnlyEvents = await request('Latest iPhone 17 Pro price in UAE', 'TitleOnlyProductFixture');
     const titleOnlyMeta = titleOnlyEvents.find((event) => event.event === 'meta')?.data;
-    assert.equal(titleOnlyMeta.tools.some((tool) => tool.type === 'currency'), false);
-    assert.equal(titleOnlyMeta.sources.some((source) => source.provider === 'ExchangeRate-API'), false);
+    const titleOnlyFx = titleOnlyMeta.tools.find((tool) => tool.type === 'currency')?.data;
+    assert.ok(titleOnlyFx);
+    assert.equal(titleOnlyFx.from, 'AED');
+    assert.equal(titleOnlyFx.rate, 22.5);
+    assert.equal(titleOnlyFx.quote, undefined);
+    assert.equal(titleOnlyMeta.sources.some((source) => source.provider === 'ExchangeRate-API'), true);
     assert.match(titleOnlyMeta.toolErrors.map((error) => error.message).join('\n'), /does not clearly associate that price.*clearer listing/i);
-    assert.match(titleOnlyEvents.filter((event) => event.event === 'token').map((event) => event.data.t).join(''), /Please share a listing that names the model beside its price/);
-    assert.match(provider.calls.at(-1).body.messages[0].content, /Samsung Galaxy S25 price in UAE: AED 3,299/);
+    const titleOnlyAnswer = titleOnlyEvents.filter((event) => event.event === 'token').map((event) => event.data.t).join('');
+    assert.match(titleOnlyAnswer, /choose or share a current listing that names the exact model beside its price/);
+    assert.doesNotMatch(titleOnlyAnswer, /3,299/);
 
     const explicitEvents = await request('Latest iPhone 17 Pro price in UAE', 'ExplicitProductFixture');
     const explicitMeta = explicitEvents.find((event) => event.event === 'meta')?.data;

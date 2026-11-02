@@ -39,7 +39,8 @@ globalThis.fetch = async (input, init) => {
         content,
         published_date: publishedAt(),
       });
-      const content = /mixedproductfixture/i.test(query) ? 'iPhone 17 Pro price in UAE: AED 4,699. Samsung Galaxy S25 price in UAE: AED 3,299.'
+      const content = /rejectedproductquotefixture/i.test(query) ? 'Samsung Galaxy S25 price in UAE: AED 5,349.'
+        : /mixedproductfixture/i.test(query) ? 'iPhone 17 Pro price in UAE: AED 4,699. Samsung Galaxy S25 price in UAE: AED 3,299.'
         : /titleonlyproductfixture/i.test(query) ? 'Samsung Galaxy S25 price in UAE: AED 3,299.'
           : /explicitproductfixture/i.test(query) ? 'The listed price for iPhone 17 Pro in UAE is AED 4,699.'
             : /multimodelfixture/i.test(query) ? 'iPhone 17 Pro price in UAE: AED 4,699. iPhone 17 price in UAE: AED 3,299.'
@@ -62,6 +63,7 @@ globalThis.fetch = async (input, init) => {
                                       : 'iPhone 17 price in UAE: AED 3,999 per item.';
       const result = makeResult(content);
       if (/titleonlyproductfixture/i.test(query)) result.title = 'iPhone 17 Pro latest price listing in UAE';
+      if (/rejectedproductquotefixture/i.test(query)) result.title = 'iPhone 17 Pro current price listing in UAE';
       if (/stale/i.test(query)) result.published_date = publishedAt(48 * 60 * 60 * 1000);
       if (/undated/i.test(query)) delete result.published_date;
       if (/conflictingfixture/i.test(query))
@@ -80,6 +82,10 @@ globalThis.fetch = async (input, init) => {
         url: `https://${isDubai ? 'gold-dubai' : 'gold-market'}.example.test/${karat.toLowerCase()}-rate`,
         content: `${karat} gold${isDubai ? ' in Dubai' : ''} is ${currency} ${amount} per gram.`,
       };
+      if (/missingpurityfixture/i.test(query)) {
+        result.title = 'Current 24K gold price in the United States';
+        result.content = '24K gold in the United States is USD 61.70 per gram.';
+      }
       if (!/undated/i.test(query)) result.published_date = /stale/i.test(query) ? publishedAt(48 * 60 * 60 * 1000) : publishedAt();
       if (/ambiguous/i.test(query)) {
         const second = { ...result, title: `Another ${isDubai ? 'Dubai ' : ''}${karat} gold price`, url: 'https://other-gold.example.test/rate', content: `${karat} gold${isDubai ? ' in Dubai' : ''} is ${currency} ${Number(amount) + 5} per gram.` };
@@ -107,6 +113,7 @@ globalThis.fetch = async (input, init) => {
   }
 
   if (url.hostname === 'open.er-api.com' && /^\/v6\/latest\/[A-Z]{3}$/i.test(url.pathname)) {
+    if (process.env.MOCK_EXCHANGE_RATE_FAILURE === '1') return new Response('{"result":"error"}', { status: 503, headers: { 'content-type': 'application/json' } });
     const base = url.pathname.split('/').at(-1).toUpperCase();
     const rates = {
       USD: { INR: 83.5, AED: 3.67, GBP: 0.79, EUR: 0.92 },
