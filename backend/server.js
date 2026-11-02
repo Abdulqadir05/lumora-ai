@@ -608,14 +608,169 @@ function parsePriceCandidates(text) {
           : /^(?:troy ounce|troy ounces)$/.test(rawUnit) ? 'per troy ounce'
             : /^(?:ounce|ounces|oz)$/.test(rawUnit) ? 'per ounce'
               : 'per item';
-      candidates.push({ from, amount: value, unit: normalizedUnit, start: match.index, end: match.index + match[0].length });
+      candidates.push({ from, amount: value, unit: normalizedUnit, sourcePrice: match[0], start: match.index, end: match.index + match[0].length });
     }
   }
   return candidates.sort((a, b) => a.start - b.start);
 }
 
+function specificIphoneModels(text) {
+  return [...text.matchAll(/\biPhone\s+\d{1,2}(?:\s+(?:Pro(?:\s+Max)?|Max|Plus|Air))?\b/gi)].map((match) => ({
+    label: match[0].replace(/\s+/g, ' ').replace(/^iphone/i, 'iPhone').replace(/\b(pro|max|plus|air)\b/gi, (word) => word[0].toUpperCase() + word.slice(1)),
+    key: match[0].replace(/\s+/g, ' ').toLowerCase(),
+    start: match.index,
+    end: match.index + match[0].length,
+  }));
+}
+
+function sentenceBounds(text, start, end) {
+  const left = text.slice(0, start);
+  const right = text.slice(end);
+  const leftBoundary = Math.max(left.lastIndexOf('\n'), left.lastIndexOf('.'), left.lastIndexOf(';'), left.lastIndexOf('!'), left.lastIndexOf('?')) + 1;
+  const rightBoundaries = ['\n', '.', ';', '!', '?'].map((character) => right.indexOf(character)).filter((index) => index >= 0);
+  const rightBoundary = rightBoundaries.length ? Math.min(...rightBoundaries) : right.length;
+  return { start: leftBoundary, end: end + rightBoundary };
+}
+
+const OTHER_PRODUCT_ANCHOR = /\b(?:Samsung|Galaxy|Google Pixel|Pixel|Xiaomi|Redmi|OnePlus|Huawei|Oppo|Vivo|Motorola|Sony(?:\s+Xperia)?|MacBook|iPad|Apple Watch|Surface(?:\s+Pro)?|ThinkPad|PlayStation|Xbox|Nintendo Switch|laptops?|tablets?|cameras?|televisions?|smartwatches?|headphones?|earbuds?)\b/gi;
+const PRODUCT_REFERENCE = /^\s*(?:(?:its|the same)\s+(?:current\s+)?(?:price|cost|retail price)|(?:this|that)\s+(?:same\s+)?(?:model|phone|device)\b|(?:the price|the cost)\s+of\s+it|it\s+(?:costs|is priced|retails|starts at)|(?:final|discounted|sale)\s+price)\b/i;
+
+function productIdentityForPrice(text, quote) {
+  const sentence = text.slice(quote.sentenceStart, quote.sentenceEnd);
+  const anchors = [
+    ...specificIphoneModels(sentence).map((model) => ({ kind: 'iphone', model, start: model.start, end: model.end })),
+    ...[...sentence.matchAll(OTHER_PRODUCT_ANCHOR)].map((match) => ({ kind: 'other', start: match.index, end: match.index + match[0].length })),
+  ];
+  const priceStart = quote.start - quote.sentenceStart;
+  const priceEnd = quote.end - quote.sentenceStart;
+  if (anchors.length) {
+    const ranked = anchors
+      .map((anchor) => ({
+        ...anchor,
+        distance: anchor.end <= priceStart ? priceStart - anchor.end : anchor.start >= priceEnd ? anchor.start - priceEnd : 0,
+      }))
+      .sort((a, b) => a.distance - b.distance);
+    if (ranked.length > 1 && ranked[0].distance === ranked[1].distance) return null;
+    return ranked[0].kind === 'iphone' ? ranked[0].model : null;
+  }
+
+  // Carry identity into an adjacent sentence only when an explicit reference
+  // ties the price to the immediately preceding, single identified iPhone.
+  if (!PRODUCT_REFERENCE.test(sentence)) return null;
+  const priorText = text.slice(0, quote.sentenceStart).replace(/[\s.;!?]+$/, '');
+  const priorBoundary = Math.max(priorText.lastIndexOf('\n'), priorText.lastIndexOf('.'), priorText.lastIndexOf(';'), priorText.lastIndexOf('!'), priorText.lastIndexOf('?')) + 1;
+  const priorSentence = priorText.slice(priorBoundary);
+  const priorModels = specificIphoneModels(priorSentence);
+  const priorOtherProducts = [...priorSentence.matchAll(OTHER_PRODUCT_ANCHOR)];
+  const distinctPriorModels = [...new Map(priorModels.map((model) => [model.key, model])).values()];
+  return distinctPriorModels.length === 1 && priorOtherProducts.length === 0 ? distinctPriorModels[0] : null;
+}
+
+function productPriceCandidates(text, intent) {
+  const code = `(?:${[...FX_CODES].sort().join('|')})`;
+  const amount = '(?:\\d{1,3}(?:,\\d{3})+|\\d+)(?:\\.\\d{1,2})?';
+  const patterns = [
+    { regex: new RegExp(`\\b(${code})\\s*(${amount})\\b`, 'gi'), currency: 1, amount: 2 },
+    { regex: new RegExp(`\\b(${amount})\\s*(${code})\\b`, 'gi'), currency: 2, amount: 1 },
+    { regex: new RegExp(`([₹$£€])\\s*(${amount})\\b`, 'g'), symbol: 1, amount: 2 },
+    { regex: new RegExp(`\\b(${amount})\\s*([₹$£€])`, 'g'), symbol: 2, amount: 1 },
+  ];
+  const candidates = [];
+  const inferredCurrency = inferLocationCurrency(text);
+  for (const pattern of patterns) {
+    for (const match of text.matchAll(pattern.regex)) {
+      const value = Number(match[pattern.amount].replace(/,/g, ''));
+      if (!Number.isFinite(value) || value <= 0 || value > 1e12) continue;
+      let from = pattern.currency ? normalizeCurrencyToken(match[pattern.currency]) : null;
+      let ambiguousCurrency = false;
+      if (pattern.symbol) {
+        const symbol = match[pattern.symbol];
+        const prefix = text.slice(Math.max(0, match.index - 16), match.index);
+        const localCurrency = intent.expectedFrom || inferredCurrency || (prefix.match(/\b(?:USD|AED|INR|GBP|EUR)\b/i)?.[0].toUpperCase() || null);
+        if (symbol === '₹') from = 'INR';
+        else if (symbol === '€') from = 'EUR';
+        else if (symbol === '$') from = localCurrency === 'USD' ? 'USD' : null;
+        else if (symbol === '£') from = localCurrency === 'GBP' ? 'GBP' : null;
+        ambiguousCurrency = !from;
+      }
+      if (from && !FX_CODES.has(from)) continue;
+      const start = match.index;
+      const end = start + match[0].length;
+      const bounds = sentenceBounds(text, start, end);
+      const sentencePrefix = text.slice(bounds.start, start);
+      if (/\b(?:shipping|delivery|freight|postage|handling|tax|fee|fees|charge|charges|deposit|installment|monthly)\b[^.;!?]*$/i.test(sentencePrefix)) continue;
+      candidates.push({ from, amount: value, unit: 'per item', sourcePrice: match[0], start, end, ambiguousCurrency, sentenceStart: bounds.start, sentenceEnd: bounds.end });
+    }
+  }
+  const unique = new Map(candidates.map((candidate) => [`${candidate.start}|${candidate.end}|${candidate.from || 'ambiguous'}`, candidate]));
+  return [...unique.values()].sort((a, b) => a.start - b.start);
+}
+
+function extractVerifiedProductQuote(results, intent) {
+  if (!intent.subject.label) return { quote: null, reason: 'The product could not be identified, so no price conversion was calculated.' };
+  const candidates = [];
+  let sawPriceText = false;
+  let sawAmbiguousCurrency = false;
+  let sawAmbiguousProduct = false;
+  let sawStalePrice = false;
+  for (const result of results || []) {
+    const text = `${result.title || ''}\n${result.snippet || ''}`;
+    if (!/\b(price|cost|retail|starting at|from)\b/i.test(text)) continue;
+    sawPriceText = true;
+    const quotes = productPriceCandidates(text, intent);
+    const needsFinalPrice = /\b(?:discount|discounted|save|savings?|coupon|promo(?:tion)?|cashback|\d+(?:\.\d+)?\s*%\s*off)\b|\b(?:final|discounted|sale)\s+price\b/i.test(text);
+    if (needsFinalPrice) {
+      const finalPriceQuotes = quotes.filter((quote) => /\b(?:final|discounted|sale)\s+price\s*(?:is|:|-)?\s*$|\bnow\s+(?:only\s+)?[:=-]?\s*$/i.test(text.slice(Math.max(quote.sentenceStart, quote.start - 55), quote.start)));
+      if (!finalPriceQuotes.length) continue;
+      quotes.splice(0, quotes.length, ...finalPriceQuotes);
+    }
+    for (const quote of quotes) {
+      if (quote.ambiguousCurrency) {
+        sawAmbiguousCurrency = true;
+        continue;
+      }
+      if (!quote.from || (intent.expectedFrom && quote.from !== intent.expectedFrom)) continue;
+      const product = productIdentityForPrice(text, quote);
+      if (!product) {
+        sawAmbiguousProduct = true;
+        continue;
+      }
+      const requested = intent.subject.label.toLowerCase().replace(/\s+/g, ' ').trim();
+      if (requested !== 'iphone' && product.key !== requested) continue;
+      const publishedAt = safeIsoDate(result.publishedAt);
+      const age = publishedAt ? Date.now() - Date.parse(publishedAt) : Infinity;
+      if (!publishedAt || age < -5 * 60 * 1000 || age > 24 * 60 * 60 * 1000) {
+        sawStalePrice = true;
+        continue;
+      }
+      candidates.push({ ...quote, product: product.label, result, publishedAt });
+    }
+  }
+  const unique = new Map(candidates.map((candidate) => [`${candidate.product.toLowerCase()}|${candidate.from}|${candidate.amount}|${candidate.unit}`, candidate]));
+  if (unique.size > 1) {
+    const refs = [...new Set([...unique.values()].map((candidate) => candidate.result.n).filter(Number.isInteger))];
+    return { quote: null, reason: `Search found conflicting current product prices${refs.length ? ` in sources ${refs.map((number) => `[${number}]`).join(', ')}` : ''}. Ask the user to choose a listing before converting.` };
+  }
+  if (unique.size === 1) {
+    const candidate = [...unique.values()][0];
+    return {
+      quote: {
+        kind: 'product', label: candidate.product, amount: candidate.amount, currency: candidate.from, unit: candidate.unit, displayPrice: candidate.sourcePrice,
+        title: candidate.result.title, url: candidate.result.url, domain: candidate.result.domain,
+        publishedAt: candidate.publishedAt, retrievedAt: candidate.result.retrievedAt, sourceNumber: candidate.result.n,
+      },
+    };
+  }
+  if (sawAmbiguousCurrency) return { quote: null, reason: 'The product price uses a currency symbol that is ambiguous without a clear currency code or location; no conversion was calculated.' };
+  if (sawAmbiguousProduct) return { quote: null, reason: 'The search result does not clearly associate that price with one specific iPhone model. Ask the user for a clearer listing that names the model beside its price.' };
+  if (sawStalePrice) return { quote: null, reason: 'The product price source is undated or older than 24 hours, so it cannot support a current conversion.' };
+  if (sawPriceText) return { quote: null, reason: 'No unambiguous numeric product price and currency were verified, so no conversion was calculated.' };
+  return { quote: null, reason: 'The search results do not clearly identify a product price, so no conversion was calculated.' };
+}
+
 function extractVerifiedPriceQuote(results, intent) {
   if (!intent?.subject) return { quote: null, reason: 'The price subject could not be identified.' };
+  if (intent.subject.kind === 'product') return extractVerifiedProductQuote(results, intent);
   if (intent.subject.kind === 'gold' && !intent.subject.karat)
     return { quote: null, reason: 'Gold purity was not specified, so no price conversion was calculated.' };
   if (intent.subject.kind === 'product' && !intent.subject.label)
@@ -674,6 +829,7 @@ function extractVerifiedPriceQuote(results, intent) {
         amount: candidate.amount,
         currency: candidate.from,
         unit: candidate.unit,
+        displayPrice: candidate.sourcePrice,
         title: candidate.result.title,
         url: candidate.result.url,
         domain: candidate.result.domain,
@@ -1088,12 +1244,13 @@ async function getSearch({ query, topic = 'general', maxResults = 5 }, signal) {
       topic: topic === 'news' ? 'news' : 'general',
       search_depth: 'basic',
       max_results: Math.min(Math.max(Number(maxResults) || 5, 1), 8),
+      include_published_date: true,
     }),
   });
   const retrievedAt = new Date().toISOString();
   const results = (d?.results || [])
     .filter((r) => r?.url && r?.title)
-    .map((r) => ({ title: clip(r.title, 140), url: r.url, domain: hostOf(r.url), snippet: clip(r.content, 500), publishedAt: safeIsoDate(r.published_date), retrievedAt }));
+    .map((r) => ({ title: clip(r.title, 140), url: r.url, domain: hostOf(r.url), snippet: clip(r.content || r.raw_content, 500), publishedAt: safeIsoDate(r.published_date), retrievedAt }));
   if (!results.length) throw new HttpError(404, 'no_results', 'The web search returned no results.');
   return { query: q, results, provider: 'Tavily', providerUrl: 'https://tavily.com', retrievedAt };
 }
@@ -1254,7 +1411,7 @@ function toolContext(live) {
     } else if (type === 'currency') {
       if (data.quote) {
         blocks.push(
-          `[${data.quoteSourceN}] VERIFIED ${data.kind.toUpperCase()} PRICE (${data.quote.title}, ${data.quote.domain}, source date ${data.quote.publishedAt}, retrieved at ${data.quote.retrievedAt}): ${data.quote.label}${data.quote.karat ? ` ${data.quote.karat}` : ''} = ${data.quote.amount} ${data.quote.currency} ${data.quote.unit}. URL: ${data.quote.url}.\n[${data.n}] EXCHANGE RATE (${data.provider}, indicative midpoint, provider updated ${data.providerUpdatedAt}, retrieved at ${data.retrievedAt}): 1 ${data.from} = ${data.rate} ${data.to}. Verified calculation: ${data.calculation}. Use citations [${data.quoteSourceN}] for the quote and [${data.n}] for the rate. The result is an indicative conversion, not a bank or cash-exchange quote.`,
+          `[${data.quoteSourceN}] VERIFIED ${data.kind.toUpperCase()} PRICE (${data.quote.title}, ${data.quote.domain}, source date ${data.quote.publishedAt}, retrieved at ${data.quote.retrievedAt}): ${data.quote.label}${data.quote.karat ? ` ${data.quote.karat}` : ''} = ${data.quote.displayPrice || `${data.quote.amount} ${data.quote.currency}`} (parsed as ${data.quote.amount} ${data.quote.currency} ${data.quote.unit}). URL: ${data.quote.url}.\n[${data.n}] EXCHANGE RATE (${data.provider}, indicative midpoint, provider updated ${data.providerUpdatedAt}, retrieved at ${data.retrievedAt}): 1 ${data.from} = ${data.rate} ${data.to}. Verified calculation: ${data.calculation}. Use citations [${data.quoteSourceN}] for the quote and [${data.n}] for the rate. The result is an indicative conversion, not a bank or cash-exchange quote.`,
         );
       } else {
         blocks.push(
@@ -1315,7 +1472,7 @@ function buildSystemPrompt(live, timezone, model) {
     );
   }
   if (live.tools.some((tool) => tool.type === 'currency'))
-    parts.push('CURRENCY RESPONSE RULES: Label ExchangeRate-API values as indicative midpoint rates; they are not guaranteed bank, cash-exchange, or transaction rates. For a verified quote conversion, show the printed source amount and unit, the rate, and the exact printed calculation. Cite both the quote source and exchange-rate source. Do not recalculate from prior assistant text.');
+    parts.push('CURRENCY RESPONSE RULES: Label ExchangeRate-API values as indicative midpoint rates; they are not guaranteed bank, cash-exchange, or transaction rates. For a verified quote conversion, reproduce the source-form price exactly, state the parsed amount and per-item unit, the rate and the backend calculation, and cite both the quote source and exchange-rate source. Do not change the source amount or recalculate from prior assistant text.');
   const hasSearchResults = live.tools.some((tool) => tool.type === 'search' && Array.isArray(tool.data?.results) && tool.data.results.length > 0);
   const searchFailed = live.toolErrors.some((error) => error.type === 'search');
   if (hasSearchResults) {

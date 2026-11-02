@@ -17,11 +17,16 @@ const TAVILY_TEST_KEY = 'offline-tavily-test-key';
 
 function mockCompletion(body, last) {
   const system = body.messages.find((message) => message.role === 'system')?.content || '';
+  if (/conflicting current product prices/i.test(system)) return 'I found conflicting current prices. Which source listing should I use before converting?';
+  if (/Ask the user for a clearer listing that names the model beside its price/i.test(system)) return 'I found a price, but the source does not tie it clearly to the requested iPhone model. Please share a listing that names the model beside its price.';
   if (/CLARIFICATION REQUIRED:.*target currency/i.test(system)) return 'Which target currency should I use?';
   if (/CLARIFICATION REQUIRED:.*amount and source currency/i.test(system)) return 'What amount and source currency should I convert?';
   const verifiedCalculation = system.match(/Verified calculation: ([^\n]+?)\. Use citations \[(\d+)\] for the quote and \[(\d+)\] for the rate/);
-  if (verifiedCalculation)
-    return `The verified conversion is ${verifiedCalculation[1]} [${verifiedCalculation[2]}], using the indicative midpoint rate [${verifiedCalculation[3]}].`;
+  if (verifiedCalculation) {
+    const productQuote = system.match(/\[\d+\] VERIFIED PRODUCT PRICE \([^)]+\): ([^=]+) = (.+?) \(parsed as ([^)]+)\)\. URL:/);
+    const original = productQuote ? `The source lists ${productQuote[2]} for ${productQuote[1]} (parsed as ${productQuote[3]}). ` : '';
+    return `${original}The verified conversion is ${verifiedCalculation[1]} [${verifiedCalculation[2]}], using the indicative midpoint rate [${verifiedCalculation[3]}].`;
+  }
   const weatherLine = system.split('\n').find((line) => /^\[\d+\] WEATHER \(/.test(line));
   if (weatherLine) {
     const number = weatherLine.match(/^\[(\d+)\]/)?.[1] || '1';
@@ -561,7 +566,7 @@ test('weather follow-up replaces the city and retains the prior forecast period'
   assert.match(provider.calls.at(-1).body.messages[0].content, /Replace the previous location with the newly resolved location/);
 });
 
-test('product price follow-up re-searches and converts only a fresh, explicit amount and item unit', async () => {
+test('product price follow-up re-searches and preserves the identified product and source', async () => {
   const { url, child } = await startServer({ LUMORA_CLIENT_TOKENS: TOKEN, TAVILY_API_KEY: TAVILY_TEST_KEY });
   try {
     const response = await fetch(`${url}/api/chat/stream`, {
@@ -579,6 +584,13 @@ test('product price follow-up re-searches and converts only a fresh, explicit am
     assert.equal(fx.to, 'INR');
     assert.equal(fx.amount, 3999);
     assert.equal(fx.unit, 'per item');
+    assert.equal(fx.quote.label, 'iPhone 17');
+    assert.equal(fx.quote.displayPrice, 'AED 3,999');
+    assert.equal(fx.quote.title, 'Latest iPhone price listing');
+    assert.equal(fx.quote.url, 'https://shop.example.test/iphone-price');
+    assert.equal(fx.quote.domain, 'shop.example.test');
+    assert.ok(fx.quote.publishedAt);
+    assert.ok(fx.quote.retrievedAt);
     assert.equal(fx.result, 89977.5);
     assert.equal(fx.quoteSourceN, 1);
     assert.equal(fx.n, 2);
@@ -619,8 +631,7 @@ test('stale, undated, and conflicting market prices never create a conversion', 
     for (const [marker, expected] of [
       ['StaleFixture', /older than 24 hours/],
       ['UndatedFixture', /undated or older than 24 hours/],
-      ['AmbiguousFixture', /conflicting current prices/],
-      ['NoUnitFixture', /No unambiguous numeric price and unit/],
+      ['AmbiguousFixture', /conflicting current product prices/],
     ]) {
       const response = await fetch(`${url}/api/chat/stream`, {
         method: 'POST', headers: auth,
@@ -638,6 +649,181 @@ test('stale, undated, and conflicting market prices never create a conversion', 
       assert.equal(meta.sources.some((source) => source.provider === 'ExchangeRate-API'), false);
       assert.match(meta.toolErrors.map((error) => error.message).join('\n'), expected);
     }
+  } finally {
+    child.kill();
+  }
+});
+
+test('product price formats map explicit currencies to fresh backend conversions', async () => {
+  const { url, child } = await startServer({ LUMORA_CLIENT_TOKENS: TOKEN, TAVILY_API_KEY: TAVILY_TEST_KEY });
+  const cases = [
+    { marker: 'AEDPrefixFixture', location: 'UAE', target: 'INR', from: 'AED', amount: 4699, displayPrice: 'AED 4,699', rate: 22.5, result: 105727.5 },
+    { marker: 'AEDDecimalFixture', location: 'UAE', target: 'INR', from: 'AED', amount: 4699, displayPrice: 'AED 4,699.00', rate: 22.5, result: 105727.5 },
+    { marker: 'AEDSuffixFixture', location: 'UAE', target: 'INR', from: 'AED', amount: 4699, displayPrice: '4,699 AED', rate: 22.5, result: 105727.5 },
+    { marker: 'USDCodeFixture', location: 'USA', target: 'INR', from: 'USD', amount: 999, displayPrice: 'USD 999', rate: 83.5, result: 83416.5 },
+    { marker: 'INRCodeFixture', location: 'India', target: 'AED', from: 'INR', amount: 79900, displayPrice: 'INR 79,900', rate: 0.044, result: 3515.6 },
+    { marker: 'RupeeSymbolFixture', location: 'India', target: 'AED', from: 'INR', amount: 79900, displayPrice: '₹79,900', rate: 0.044, result: 3515.6 },
+    { marker: 'DollarSymbolFixture', location: 'USA', target: 'INR', from: 'USD', amount: 999, displayPrice: '$999', rate: 83.5, result: 83416.5 },
+  ];
+  try {
+    for (const item of cases) {
+      const history = [
+        { role: 'user', content: `Latest iPhone 17 price in ${item.location} ${item.marker}` },
+        { role: 'assistant', content: 'A previous answer guessed a different price.' },
+        { role: 'user', content: `Convert to ${item.target}` },
+      ];
+      const response = await fetch(`${url}/api/chat/stream`, {
+        method: 'POST', headers: auth, body: chatConversationBody(history),
+      });
+      assert.equal(response.status, 200, item.marker);
+      const events = parseSSE(await response.text());
+      const meta = events.find((event) => event.event === 'meta')?.data;
+      const fx = meta.tools.find((tool) => tool.type === 'currency')?.data;
+      assert.ok(fx, item.marker);
+      assert.equal(fx.from, item.from, item.marker);
+      assert.equal(fx.to, item.target, item.marker);
+      assert.equal(fx.amount, item.amount, item.marker);
+      assert.equal(fx.rate, item.rate, item.marker);
+      assert.equal(fx.result, item.result, item.marker);
+      assert.equal(fx.quote.label, 'iPhone 17', item.marker);
+      assert.equal(fx.quote.displayPrice, item.displayPrice, item.marker);
+      assert.equal(fx.quoteSourceN, 1, item.marker);
+      assert.equal(fx.n, 2, item.marker);
+      assert.deepEqual(meta.sources.map((source) => source.n), [1, 2], item.marker);
+      const answer = events.filter((event) => event.event === 'token').map((event) => event.data.t).join('');
+      assert.ok(answer.includes(item.displayPrice), item.marker);
+      assert.match(answer, new RegExp(`${item.amount} ${item.from} per item.*${item.result} ${item.target} per item`, 's'), item.marker);
+      assert.match(answer, /\[1\].*\[2\]/s, item.marker);
+    }
+
+    const history = [
+      { role: 'user', content: 'Latest iPhone 17 price in UAE AEDPrefixFixture' },
+      { role: 'assistant', content: 'A previous answer guessed AED 8,888.' },
+      { role: 'user', content: 'Convert to INR' },
+    ];
+    const streamResult = await fetch(`${url}/api/chat/stream`, { method: 'POST', headers: auth, body: chatConversationBody(history) });
+    const streamMeta = parseSSE(await streamResult.text()).find((event) => event.event === 'meta')?.data;
+    const nonStreamResult = await fetch(`${url}/api/chat`, { method: 'POST', headers: auth, body: chatConversationBody(history) });
+    const nonStream = await nonStreamResult.json();
+    assert.equal(streamResult.status, 200);
+    assert.equal(nonStreamResult.status, 200);
+    assert.equal(nonStream.tools.find((tool) => tool.type === 'currency').data.result, streamMeta.tools.find((tool) => tool.type === 'currency').data.result);
+    assert.deepEqual(nonStream.sources.map((source) => source.n), [1, 2]);
+    assert.match(provider.calls.at(-1).body.messages[0].content, /Verified calculation: 4699 AED per item/);
+    assert.doesNotMatch(provider.calls.at(-1).body.messages[0].content, /AED 8,888/);
+  } finally {
+    child.kill();
+  }
+});
+
+test('product-price validation excludes shipping, discounts without final prices, and ambiguous listings', async () => {
+  const { url, child } = await startServer({ LUMORA_CLIENT_TOKENS: TOKEN, TAVILY_API_KEY: TAVILY_TEST_KEY });
+  try {
+    const shipping = await fetch(`${url}/api/chat/stream`, {
+      method: 'POST', headers: auth,
+      body: chatConversationBody([
+        { role: 'user', content: 'Latest iPhone 17 price in UAE ShippingFixture' },
+        { role: 'user', content: 'Convert to INR' },
+      ]),
+    });
+    const shippingMeta = parseSSE(await shipping.text()).find((event) => event.event === 'meta')?.data;
+    assert.equal(shippingMeta.tools.find((tool) => tool.type === 'currency').data.amount, 4699);
+
+    for (const [marker, location, target, expectedError] of [
+      ['ConflictingFixture', 'UAE', 'INR', /conflicting current product prices.*choose a listing/i],
+      ['ShippingOnlyFixture', 'UAE', 'INR', /No unambiguous numeric product price and currency/],
+      ['MissingCurrencyFixture', 'UAE', 'INR', /No unambiguous numeric product price and currency/],
+      ['MissingPriceFixture', 'UAE', 'INR', /No unambiguous numeric product price and currency/],
+      ['AmbiguousProductFixture', 'UAE', 'INR', /does not clearly associate that price with one specific iPhone model/],
+      ['AmbiguousDollarFixture', '', 'INR', /currency symbol that is ambiguous/],
+      ['DiscountFixture', 'UAE', 'INR', /No unambiguous numeric product price and currency/],
+    ]) {
+      const locationText = location ? ` in ${location}` : '';
+      const response = await fetch(`${url}/api/chat/stream`, {
+        method: 'POST', headers: auth,
+        body: chatConversationBody([
+          { role: 'user', content: `Latest iPhone 17 price${locationText} ${marker}` },
+          { role: 'user', content: `Convert to ${target}` },
+        ]),
+      });
+      assert.equal(response.status, 200, marker);
+      const events = parseSSE(await response.text());
+      const meta = events.find((event) => event.event === 'meta')?.data;
+      assert.ok(meta.tools.some((tool) => tool.type === 'search'), marker);
+      assert.equal(meta.tools.some((tool) => tool.type === 'currency'), false, marker);
+      assert.equal(meta.sources.some((source) => source.provider === 'ExchangeRate-API'), false, marker);
+      assert.match(meta.toolErrors.map((error) => error.message).join('\n'), expectedError, marker);
+      assert.doesNotMatch(provider.calls.at(-1).body.messages[0].content, /Verified calculation:/, marker);
+      if (marker === 'ConflictingFixture') {
+        assert.deepEqual(meta.sources.map((source) => source.url), [
+          'https://shop.example.test/iphone-price',
+          'https://other-retailer.example.test/iphone-price',
+        ]);
+        const answer = events.filter((event) => event.event === 'token').map((event) => event.data.t).join('');
+        assert.match(answer, /Which source listing should I use/);
+      }
+    }
+
+    const finalPrice = await fetch(`${url}/api/chat/stream`, {
+      method: 'POST', headers: auth,
+      body: chatConversationBody([
+        { role: 'user', content: 'Latest iPhone 17 price in UAE DiscountFinalFixture' },
+        { role: 'user', content: 'Convert to INR' },
+      ]),
+    });
+    const finalMeta = parseSSE(await finalPrice.text()).find((event) => event.event === 'meta')?.data;
+    const finalCurrency = finalMeta.tools.find((tool) => tool.type === 'currency');
+    assert.ok(finalCurrency, JSON.stringify(finalMeta.toolErrors));
+    assert.equal(finalCurrency.data.amount, 4399);
+  } finally {
+    child.kill();
+  }
+});
+
+test('product prices stay associated with their iPhone model in mixed and multi-model results', async () => {
+  const { url, child } = await startServer({ LUMORA_CLIENT_TOKENS: TOKEN, TAVILY_API_KEY: TAVILY_TEST_KEY });
+  const request = async (firstMessage, marker) => {
+    const response = await fetch(`${url}/api/chat/stream`, {
+      method: 'POST', headers: auth,
+      body: chatConversationBody([
+        { role: 'user', content: `${firstMessage} ${marker}` },
+        { role: 'assistant', content: 'I will use only a current, source-verified listing.' },
+        { role: 'user', content: 'Convert to INR' },
+      ]),
+    });
+    assert.equal(response.status, 200, marker);
+    return parseSSE(await response.text());
+  };
+  try {
+    const mixedEvents = await request('Latest iPhone 17 Pro price in UAE', 'MixedProductFixture');
+    const mixedMeta = mixedEvents.find((event) => event.event === 'meta')?.data;
+    const mixedFx = mixedMeta.tools.find((tool) => tool.type === 'currency')?.data;
+    assert.equal(mixedFx.amount, 4699);
+    assert.equal(mixedFx.from, 'AED');
+    assert.equal(mixedFx.quote.label, 'iPhone 17 Pro');
+    assert.equal(mixedFx.quote.displayPrice, 'AED 4,699');
+    assert.equal(mixedMeta.sources[0].url, 'https://shop.example.test/iphone-price');
+    assert.equal(mixedFx.quoteSourceN, mixedMeta.sources[0].n);
+
+    const titleOnlyEvents = await request('Latest iPhone 17 Pro price in UAE', 'TitleOnlyProductFixture');
+    const titleOnlyMeta = titleOnlyEvents.find((event) => event.event === 'meta')?.data;
+    assert.equal(titleOnlyMeta.tools.some((tool) => tool.type === 'currency'), false);
+    assert.equal(titleOnlyMeta.sources.some((source) => source.provider === 'ExchangeRate-API'), false);
+    assert.match(titleOnlyMeta.toolErrors.map((error) => error.message).join('\n'), /does not clearly associate that price.*clearer listing/i);
+    assert.match(titleOnlyEvents.filter((event) => event.event === 'token').map((event) => event.data.t).join(''), /Please share a listing that names the model beside its price/);
+    assert.match(provider.calls.at(-1).body.messages[0].content, /Samsung Galaxy S25 price in UAE: AED 3,299/);
+
+    const explicitEvents = await request('Latest iPhone 17 Pro price in UAE', 'ExplicitProductFixture');
+    const explicitMeta = explicitEvents.find((event) => event.event === 'meta')?.data;
+    assert.equal(explicitMeta.tools.find((tool) => tool.type === 'currency').data.amount, 4699);
+    assert.equal(explicitMeta.tools.find((tool) => tool.type === 'currency').data.quote.label, 'iPhone 17 Pro');
+
+    const multiModelEvents = await request('Latest iPhone 17 Pro price in UAE', 'MultiModelFixture');
+    const multiModelMeta = multiModelEvents.find((event) => event.event === 'meta')?.data;
+    const multiModelFx = multiModelMeta.tools.find((tool) => tool.type === 'currency')?.data;
+    assert.equal(multiModelFx.amount, 4699);
+    assert.equal(multiModelFx.quote.label, 'iPhone 17 Pro');
+    assert.equal(multiModelFx.quote.displayPrice, 'AED 4,699');
   } finally {
     child.kill();
   }

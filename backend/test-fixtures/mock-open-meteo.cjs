@@ -28,22 +28,46 @@ globalThis.fetch = async (input, init) => {
     const key = process.env.TAVILY_API_KEY || '';
     if (!key || init?.headers?.Authorization !== `Bearer ${key}`) throw new Error('Unexpected Tavily request authentication');
     const body = JSON.parse(init.body || '{}');
-    if (body.search_depth !== 'basic' || body.max_results < 1 || body.max_results > 8)
+    if (body.search_depth !== 'basic' || body.max_results < 1 || body.max_results > 8 || body.include_published_date !== true)
       throw new Error('Unexpected Tavily search options');
     const query = String(body.query || '').toLowerCase();
     const publishedAt = (ageMs = 60_000) => new Date(Date.now() - ageMs).toISOString();
     if (/iphone/.test(query)) {
-      const result = {
-        title: 'Latest iPhone price in UAE',
-        url: 'https://shop.example.test/iphone-price',
-        content: /nounit/i.test(query) ? 'iPhone 17 price in UAE: AED 3,999.' : 'iPhone 17 price in UAE: AED 3,999 per item.',
-      };
-      if (!/undated/i.test(query)) result.published_date = /stale/i.test(query) ? publishedAt(48 * 60 * 60 * 1000) : publishedAt();
-      if (/ambiguous/i.test(query)) {
-        const second = { ...result, title: 'Another iPhone price in UAE', url: 'https://other-shop.example.test/iphone-price', content: 'iPhone 17 price in UAE: AED 4,099 per item.' };
-        if (!/undated/i.test(query)) second.published_date = publishedAt();
-        return jsonResponse({ results: [result, second] });
-      }
+      const makeResult = (content, suffix = 'shop', title = 'Latest iPhone price listing') => ({
+        title,
+        url: `https://${suffix}.example.test/iphone-price`,
+        content,
+        published_date: publishedAt(),
+      });
+      const content = /mixedproductfixture/i.test(query) ? 'iPhone 17 Pro price in UAE: AED 4,699. Samsung Galaxy S25 price in UAE: AED 3,299.'
+        : /titleonlyproductfixture/i.test(query) ? 'Samsung Galaxy S25 price in UAE: AED 3,299.'
+          : /explicitproductfixture/i.test(query) ? 'The listed price for iPhone 17 Pro in UAE is AED 4,699.'
+            : /multimodelfixture/i.test(query) ? 'iPhone 17 Pro price in UAE: AED 4,699. iPhone 17 price in UAE: AED 3,299.'
+              : /aedprefixfixture/i.test(query) ? 'iPhone 17 price in UAE: AED 4,699.'
+        : /aedsuffixfixture/i.test(query) ? 'iPhone 17 price in UAE: 4,699 AED.'
+          : /aeddecimalfixture/i.test(query) ? 'iPhone 17 price in UAE: AED 4,699.00.'
+            : /usdcodefixture/i.test(query) ? 'iPhone 17 price in USA: USD 999.'
+              : /inrcodefixture/i.test(query) ? 'iPhone 17 price in India: INR 79,900.'
+                : /rupeesymbolfixture/i.test(query) ? 'iPhone 17 price in India: ₹79,900.'
+                  : /dollarsymbolfixture/i.test(query) ? 'iPhone 17 price in USA: $999.'
+                    : /ambiguousdollarfixture/i.test(query) ? 'iPhone 17 price: $999.'
+                      : /conflictingfixture/i.test(query) ? 'iPhone 17 price in UAE: AED 4,699.'
+                        : /shippingfixture/i.test(query) ? 'iPhone 17 price in UAE: AED 4,699. Shipping charge: AED 25.'
+                          : /shippingonlyfixture/i.test(query) ? 'iPhone 17 price in UAE: Shipping charge AED 25.'
+                            : /missingcurrencyfixture/i.test(query) ? 'iPhone 17 price in UAE: 4,699.'
+                              : /missingpricefixture/i.test(query) ? 'iPhone 17 price in UAE: Price unavailable.'
+                                : /ambiguousproductfixture/i.test(query) ? 'iPhone price in UAE: AED 4,699.'
+                                  : /discountfixture/i.test(query) ? 'iPhone 17 price in UAE: AED 4,699; save AED 300.'
+                                    : /discountfinalfixture/i.test(query) ? 'iPhone 17 price in UAE: List price AED 4,699. Final price: AED 4,399.'
+                                      : 'iPhone 17 price in UAE: AED 3,999 per item.';
+      const result = makeResult(content);
+      if (/titleonlyproductfixture/i.test(query)) result.title = 'iPhone 17 Pro latest price listing in UAE';
+      if (/stale/i.test(query)) result.published_date = publishedAt(48 * 60 * 60 * 1000);
+      if (/undated/i.test(query)) delete result.published_date;
+      if (/conflictingfixture/i.test(query))
+        return jsonResponse({ results: [result, makeResult('iPhone 17 price in UAE: AED 4,899.', 'other-retailer')] });
+      if (/ambiguousfixture/i.test(query))
+        return jsonResponse({ results: [result, makeResult('iPhone 17 price in UAE: AED 4,099.', 'other-shop')] });
       return jsonResponse({ results: [result] });
     }
     if (/gold/.test(query)) {
@@ -87,6 +111,7 @@ globalThis.fetch = async (input, init) => {
     const rates = {
       USD: { INR: 83.5, AED: 3.67, GBP: 0.79, EUR: 0.92 },
       AED: { INR: 22.5, USD: 0.2725, GBP: 0.215, EUR: 0.25 },
+      INR: { AED: 0.044, USD: 0.012, GBP: 0.0095, EUR: 0.011 },
       GBP: { INR: 105.5, USD: 1.27, AED: 4.65, EUR: 1.17 },
       EUR: { INR: 90.5, USD: 1.09, AED: 4.0, GBP: 0.855 },
     };
