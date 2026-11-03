@@ -1,0 +1,58 @@
+name: Bug report
+description: Report a reproducible problem in Lumora AI.
+title: "[Bug]: "
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        Do not include API keys, tokens, passwords, private conversation contents,
+        or other sensitive information. Report security vulnerabilities privately
+        using the process in SECURITY.md.
+  - type: input
+    id: version
+    attributes:
+      label: App version or commit
+      description: Include the version, build, or commit where you observed the issue.
+      placeholder: e.g. 1.0.0 or a short commit SHA
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Android app
+        - iOS app
+        - Backend/API
+        - Build or release configuration
+        - Documentation
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Provide the smallest sequence that reproduces the problem.
+      placeholder: 1. ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment and redacted logs
+      description: Include OS/device and relevant logs only after removing credentials and personal data.
+    validations:
+      required: false

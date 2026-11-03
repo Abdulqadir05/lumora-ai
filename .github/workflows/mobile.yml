@@ -1,0 +1,47 @@
+name: Mobile CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "mobile/**"
+      - ".github/workflows/mobile.yml"
+  pull_request:
+    paths:
+      - "mobile/**"
+      - ".github/workflows/mobile.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mobile-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.34.3
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.17.0
+          cache: pnpm
+          cache-dependency-path: mobile/pnpm-lock.yaml
+      - name: Install locked mobile dependencies
+        working-directory: mobile
+        run: pnpm install --frozen-lockfile
+      - name: Typecheck mobile app
+        working-directory: mobile
+        run: pnpm typecheck
+      - name: Run mobile tests
+        working-directory: mobile
+        run: pnpm test
+      - name: Run distribution tests
+        working-directory: mobile
+        run: pnpm test:distribution

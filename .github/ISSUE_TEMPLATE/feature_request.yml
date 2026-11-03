@@ -1,0 +1,36 @@
+name: Feature request
+description: Suggest a user-facing improvement or capability.
+title: "[Feature]: "
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        Please describe the user problem and desired outcome. Do not include
+        secrets or private conversation data.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem to solve
+      description: What task or user need is not handled well today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Describe what Lumora should do from the user's perspective.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+    validations:
+      required: false
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Add mockups or examples that contain no personal or sensitive data.
+    validations:
+      required: false

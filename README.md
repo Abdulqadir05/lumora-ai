@@ -1,16 +1,21 @@
 # Lumora AI
 
-A premium, multi-model generative AI assistant for **iOS and Android**, built with React Native + Expo, plus a secure Node.js backend proxy.
+A multi-model AI assistant for **iOS and Android**, built with React Native + Expo and a Node.js/Express backend. The backend keeps provider credentials server-side and protects API routes with a bearer client token and rate limits. That token is extractable from a distributed app and is not per-user authentication.
 
 ```
 lumora/
-├── AUDIT.md             Production-readiness audit report
+├── AUDIT.md             Earlier point-in-time production-readiness audit
 ├── DISTRIBUTION.md      Private distribution: signed APK, TestFlight, ad hoc IPA
+├── CONTRIBUTING.md      Local setup, tests and contribution guidelines
+├── SECURITY.md          Private vulnerability reporting policy
+├── LICENSE              MIT license for project files
+├── .github/             CI workflows and issue forms
 ├── mobile/              Complete Expo SDK 58 project (React Native 0.88, React 19.3)
 │   ├── App.js           Complete application (single file)
 │   ├── index.js         Entry point (registerRootComponent)
-│   ├── app.json         Expo config: dark UI, icons, splash, Android adjustResize
-│   ├── eas.json         EAS Build profiles (APK / AAB / IPA)
+│   ├── app.json         Static production Expo config
+│   ├── app.config.js    Preview-only app identity override
+│   ├── eas.json         EAS profiles, including production and Preview APKs
 │   ├── package.json     Pinned, SDK-matched dependencies + scripts
 │   ├── pnpm-lock.yaml   Lockfile (reproducible installs on EAS)
 │   ├── assets/          Official Lumora mark (brand/lumora-mark.svg) + generated icons & splash
@@ -22,7 +27,7 @@ lumora/
     ├── server.js
     ├── package.json
     ├── test/            node:test integration suite (mock provider)
-    └── .env.example     Provider secrets (server-only)
+    └── .env.example     Server environment-variable template (no values)
 ```
 
 ## What lives where
@@ -30,10 +35,10 @@ lumora/
 | Capability | Where | Needs |
 | --- | --- | --- |
 | UI, streaming display, Markdown, history, preferences | `App.js` (device) | none |
-| LLM calls (GPT-OSS 20B / 120B, Llama 3.3 70B) | backend | `LLM_API_KEY` |
+| LLM calls (GPT-OSS 20B, GPT-OSS 120B, Qwen 3.8 27B) | backend | `LLM_API_KEY` or `GROQ_API_KEY` |
 | Real token streaming (SSE) | backend → `expo/fetch` | backend running |
 | Model availability check | backend `GET /api/models` | `LLM_API_KEY` |
-| Weather (Open-Meteo) | backend | none (keyless) |
+| Weather (Open-Meteo through Lumora's Cloudflare Worker relay) | backend | relay URL is configured in backend code |
 | Currency (ExchangeRate-API) | backend | none (keyless) |
 | Crypto (CoinGecko) | backend | optional `COINGECKO_DEMO_API_KEY` |
 | News (Google News RSS) | backend | none (keyless) |
@@ -48,33 +53,30 @@ lumora/
 Requires Node.js 18.17+.
 
 ```bash
-cd lumora/backend
+cd backend
 cp .env.example .env          # then fill in LLM_API_KEY (and TAVILY_API_KEY, optional)
-npm install
+npm ci
 npm run dev                   # http://localhost:8787
-npm test                      # 13 integration tests against a mock provider
+npm test                      # node:test suite; provider calls are mocked
 ```
 
 Check it: `curl http://localhost:8787/api/health`
 
 ### Provider configuration
 
-Any OpenAI-compatible Chat Completions API works:
+Groq is the default provider. `LLM_BASE_URL` can point to another OpenAI-compatible Chat Completions endpoint, but alternate providers and model IDs must be configured and verified separately; only models found in the configured provider's model list are available.
 
 | Provider | `LLM_BASE_URL` | Notes |
 | --- | --- | --- |
-| Groq (default) | `https://api.groq.com/openai/v1` | Offers all three default models |
-| OpenAI | `https://api.openai.com/v1` | Map `MODEL_*` vars to OpenAI model IDs |
-| Google Gemini | `https://generativelanguage.googleapis.com/v1beta/openai` | Map `MODEL_*` vars to Gemini model IDs |
-
-The backend checks the provider's `/models` list. A model it can't find there shows as **Unavailable** in the app and can't be selected. Nothing is faked.
+| Groq (default) | `https://api.groq.com/openai/v1` | Default model IDs are configured in the backend; availability may change |
+| Other compatible endpoint | Set `LLM_BASE_URL` and the `MODEL_*` mappings | Requires compatible endpoints and model IDs |
 
 ### Production checklist
 
 - Deploy behind HTTPS (Render, Fly.io, Railway, Cloud Run, etc.). With `NODE_ENV=production`, the server rejects plain-HTTP forwarded requests.
 - Set `NODE_ENV=production` and `LUMORA_CLIENT_TOKENS` (the server won't start without tokens in production). Generate a token with `openssl rand -hex 32`.
-- Set `TRUST_PROXY=1` (or your proxy-hop count) so rate limiting sees real client IPs.
-- Rate limits (per IP, per minute) default to 120 for all `/api` traffic (applied before auth, so token floods are throttled), 20 for chat and 60 for tools (`API_RATE_PER_MIN`, `CHAT_RATE_PER_MIN`, `TOOL_RATE_PER_MIN`).
+- Configure `TRUST_PROXY` only for the actual hosting topology. Production rejects numeric hop counts. For a Render web service, use `TRUST_PROXY=render`; for other proxies, follow `backend/.env.example` and trust only known proxy IP/CIDR ranges. Do not trust arbitrary forwarding headers or use blanket proxy trust.
+- Rate limits (per IP, per minute) default to 120 for all `/api` traffic (applied before auth, so token floods are throttled), 20 for chat and 60 for tools (`API_RATE_PER_MIN`, `CHAT_RATE_PER_MIN`, `TOOL_RATE_PER_MIN`). The built-in limiter store is in-memory and per process; do not treat it as a shared quota system when running multiple instances or offering public multi-user access.
 - CORS is closed by default; the native app doesn't need it. Set `CORS_ORIGINS` to exact origins only if a browser client must call the API.
 - **Client tokens are not user authentication.** Anything inside an app binary can be extracted. For a public launch, put real per-user auth in front of `/api/*` (Clerk, Supabase Auth, Firebase Auth, Auth0, or App Attest / Play Integrity) and verify the user's JWT in the `auth` middleware.
 
@@ -82,10 +84,10 @@ The backend checks the provider's `/models` list. A model it can't find there sh
 
 ## 2. Mobile app setup
 
-`lumora/mobile` is a complete Expo SDK 58 project. Requires **Node.js 22.13+** (React Native 0.88 requirement).
+`mobile/` is the Expo SDK 58 project. It requires **Node.js 22.13+** (React Native 0.88 requirement).
 
 ```bash
-cd lumora/mobile
+cd mobile
 corepack enable               # provides pnpm (the committed lockfile is pnpm)
 pnpm install --frozen-lockfile
 cp .env.example .env          # then edit
@@ -103,8 +105,8 @@ Quality gates:
 
 ```bash
 pnpm typecheck                # TypeScript checkJs over App.js
-pnpm test                     # 23 Jest integration tests (jest-expo + RNTL)
-pnpm doctor                   # expo-doctor (20 checks)
+pnpm test                     # Jest integration suite (jest-expo + RNTL)
+pnpm doctor                   # Expo config and dependency diagnostics
 pnpm export:check             # production Hermes bundles for android + ios
 LUMORA_E2E_URL=http://127.0.0.1:8787 pnpm test:e2e   # real backend → real SSE → App.js
 ```
@@ -124,17 +126,13 @@ You can also change the URL at runtime under **Settings → Lumora Backend**, an
 
 ## 3. API contract
 
-All endpoints return errors as `{ "error": { "code": string, "message": string } }`. Send `Authorization: Bearer <client token>` when `LUMORA_CLIENT_TOKENS` is set.
+Protected endpoints return errors as `{ "error": { "code": string, "message": string } }`. Send `Authorization: Bearer <client token>` on API data routes; the minimal liveness endpoint `GET /api/health` and allowed CORS preflight requests are exceptions. Production requires `LUMORA_CLIENT_TOKENS`; unauthenticated API access is allowed only for development bound to loopback. A shared token in a mobile binary is not a secure user identity.
 
 ### `GET /api/health`
 
-```json
-{ "ok": true, "version": "1.0.0", "authRequired": true,
-  "provider": { "name": "Groq", "configured": true },
-  "tools": { "search": true, "news": true, "weather": true, "crypto": true, "currency": true, "wikipedia": true } }
-```
+Unauthenticated requests receive only `{ "ok": true }`. An authenticated request also reports provider and tool readiness; this endpoint does not expose credentials.
 
-### `GET /api/models`
+### `GET /api/models` (authenticated)
 
 ```json
 { "provider": "Groq",
@@ -222,12 +220,13 @@ The full step-by-step guide, with credentials, commands and tester instructions,
 | Goal | Command | EAS profile |
 | --- | --- | --- |
 | Signed Android release APK (internal distribution, no Play Store) | `pnpm build:android:apk` | `android-apk` |
+| Separate internal Preview APK (`ai.lumora.app.preview`) | `pnpm build:android:preview` | `android-preview` |
 | iOS TestFlight build, uploaded to App Store Connect | `pnpm release:ios:testflight` | `testflight` |
 | TestFlight groups, beta info and public link | `pnpm testflight:setup` → `pnpm testflight:distribute` | — |
 | Register iPhone UDIDs | `pnpm devices:register` | — |
 | iOS ad hoc IPA for registered devices | `pnpm build:ios:adhoc` | `ios-adhoc` |
 
-All profiles share one bundle identifier, one HTTPS backend URL and one EAS environment. `scripts/check-release-env.mjs` runs on every EAS build (`eas-build-pre-install`) and blocks provider secrets. Nothing is submitted to Google Play or for public App Store release. A build only counts as successful once EAS reports `finished`.
+The production profiles use the production app identity and production EAS environment. The separate `android-preview` profile uses the Preview EAS environment, resolves to app name **Lumora AI Preview** and package `ai.lumora.app.preview`, and produces an internal APK that can be installed beside production (`ai.lumora.app`). `scripts/check-release-env.mjs` runs as an EAS pre-install hook and checks release configuration and secret-like values. Nothing is submitted to Google Play or for public App Store release. A build only counts as successful once EAS reports `finished`.
 
 ---
 
@@ -240,3 +239,11 @@ All profiles share one bundle identifier, one HTTPS backend URL and one EAS envi
 - **News links.** These are Google News redirect URLs, which open the publisher page in the browser.
 - **Search.** Without `TAVILY_API_KEY`, general web search reports "not configured". Short factual questions fall back to Wikipedia, which is labeled as such.
 - **Rate limits.** The free CoinGecko and Open-Meteo tiers are rate-limited. When that happens, the app shows a "could not be retrieved" card instead of stale or invented numbers.
+
+## License
+
+Lumora AI's project files are licensed under the MIT License in [LICENSE](./LICENSE), except where a file or third-party component states otherwise. Dependencies retain their respective upstream licenses; see their package metadata and notices when redistributing builds.
+
+## Contributing and security
+
+See [CONTRIBUTING.md](./CONTRIBUTING.md) for setup and pull request guidance. Report security vulnerabilities privately using the process in [SECURITY.md](./SECURITY.md), not in a public issue.
