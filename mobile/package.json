@@ -69,11 +69,17 @@
     ]
   },
   "overrides": {
-    "markdown-it": "^14.1.1"
+    "markdown-it": "^14.1.1",
+    "glob@10": "14.0.3",
+    "glob@13": "14.0.3",
+    "minimatch@10": "11.0.1"
   },
   "pnpm": {
     "overrides": {
-      "markdown-it": "^14.1.1"
+      "markdown-it": "^14.1.1",
+      "glob@10": "14.0.3",
+      "glob@13": "14.0.3",
+      "minimatch@10": "11.0.1"
     }
   }
 }
