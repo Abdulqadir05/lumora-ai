@@ -47,6 +47,26 @@ const LLM = {
 };
 LLM.isGroq = /groq\.com/i.test(LLM.baseUrl);
 
+const GEMINI_TTS_MODELS = new Set(['gemini-3.8-flash-tts', 'gemini-3.8-flash-lite-tts']);
+const GEMINI_API_KEY = (process.env.GEMINI_API_KEY || '').trim();
+const GEMINI_TTS_MODEL = (process.env.GEMINI_TTS_MODEL || 'gemini-3.8-flash-tts').trim();
+const GEMINI_TTS_VOICE = (process.env.GEMINI_TTS_VOICE || 'Nika').trim();
+const GEMINI_INTERACTIONS_URL = 'https://generativelanguage.googleapis.com/v1beta/interactions';
+
+// An endpoint override exists only for offline tests and only accepts loopback.
+// Production always calls Google's fixed Interactions API origin.
+function geminiTtsUrl() {
+  if (NODE_ENV !== 'test') return GEMINI_INTERACTIONS_URL;
+  try {
+    const url = new URL(process.env.LUMORA_TEST_GEMINI_TTS_URL || '');
+    if (url.protocol === 'http:' && isLoopbackHost(url.hostname) && url.pathname === '/v1beta/interactions' && !url.search && !url.hash)
+      return url.href;
+  } catch {
+    // Fall through to Google's fixed API URL.
+  }
+  return GEMINI_INTERACTIONS_URL;
+}
+
 function isSecureProviderUrl(value) {
   try {
     const url = new URL(value);
@@ -1745,6 +1765,352 @@ app.use('/api', (req, res, next) => {
 app.use(express.json({ limit: '256kb' }));
 const chatLimiter = limiter(Number(process.env.CHAT_RATE_PER_MIN) || 20);
 const toolLimiter = limiter(Number(process.env.TOOL_RATE_PER_MIN) || 60);
+const boundedTtsSetting = (name, fallback, min, max) => {
+  const raw = process.env[name]?.trim();
+  if (!raw || !/^\d+$/.test(raw)) return fallback;
+  const parsed = Number(raw);
+  return Number.isSafeInteger(parsed) ? Math.min(max, Math.max(min, parsed)) : fallback;
+};
+const geminiTtsLimiter = limiter(boundedTtsSetting('GEMINI_TTS_RATE_PER_MIN', 5, 1, 120));
+const GEMINI_TTS_MAX_CONCURRENT = boundedTtsSetting('GEMINI_TTS_MAX_CONCURRENT', 2, 1, 4);
+const GEMINI_TTS_TIMEOUT_MS = boundedTtsSetting('GEMINI_TTS_TIMEOUT_MS', 60_000, 1_000, 120_000);
+const GEMINI_TTS_MAX_TEXT_CHARS = boundedTtsSetting('GEMINI_TTS_MAX_TEXT_CHARS', 4_000, 1, 10_000);
+const GEMINI_TTS_MAX_AUDIO_BYTES = 12 * 1024 * 1024;
+const GEMINI_TTS_MAX_RESPONSE_BYTES = 18 * 1024 * 1024;
+const GEMINI_TTS_ERROR_BODY_MAX_BYTES = 8 * 1024;
+const GEMINI_TTS_ERROR_BODY_TIMEOUT_MS = 750;
+const SAFE_GEMINI_TTS_ERROR_STATUSES = new Set([
+  'ABORTED',
+  'CANCELLED',
+  'DATA_LOSS',
+  'DEADLINE_EXCEEDED',
+  'FAILED_PRECONDITION',
+  'INTERNAL',
+  'INVALID_ARGUMENT',
+  'NOT_FOUND',
+  'OUT_OF_RANGE',
+  'PERMISSION_DENIED',
+  'RESOURCE_EXHAUSTED',
+  'UNAUTHENTICATED',
+  'UNAVAILABLE',
+  'UNKNOWN',
+]);
+let activeGeminiTtsRequests = 0;
+
+function reserveGeminiTtsSlot(_req, res, next) {
+  if (activeGeminiTtsRequests >= GEMINI_TTS_MAX_CONCURRENT) {
+    return sendError(res, new HttpError(503, 'tts_busy', 'Speech generation is busy. Please try again shortly.'));
+  }
+  activeGeminiTtsRequests += 1;
+  let released = false;
+  const release = () => {
+    if (released) return;
+    released = true;
+    activeGeminiTtsRequests = Math.max(0, activeGeminiTtsRequests - 1);
+  };
+  res.once('finish', release);
+  res.once('close', release);
+  next();
+}
+
+function attachGeminiTtsCancellation(req, res, next) {
+  const controller = new AbortController();
+  req.geminiTtsSignal = controller.signal;
+  req.once('aborted', () => controller.abort());
+  res.once('close', () => {
+    if (!res.writableEnded) controller.abort();
+  });
+  next();
+}
+
+function geminiTtsProviderError(status) {
+  if (status === 401 || status === 403)
+    return new HttpError(502, 'tts_provider_auth', 'Speech generation is not available because the provider rejected the server configuration.');
+  if (status === 429)
+    return new HttpError(503, 'tts_rate_limited', 'Speech generation is temporarily rate limited. Please try again shortly.');
+  if (status >= 500)
+    return new HttpError(502, 'tts_provider_unavailable', 'Speech generation is temporarily unavailable. Please try again shortly.');
+  return new HttpError(502, 'tts_provider_rejected', 'The speech provider could not process this request. Check the configured model and voice.');
+}
+
+function safeGeminiTtsErrorCode(value) {
+  if (Number.isSafeInteger(value) && value >= 100 && value <= 599) return value;
+  if (typeof value === 'string' && SAFE_GEMINI_TTS_ERROR_STATUSES.has(value)) return value;
+  return null;
+}
+
+async function readGeminiTtsErrorDiagnostics(response) {
+  const diagnostic = { errorStatus: null, errorCode: null };
+  const body = response.body;
+  if (!body) return diagnostic;
+
+  const contentLength = Number(response.headers.get('content-length'));
+  if (Number.isFinite(contentLength) && contentLength > GEMINI_TTS_ERROR_BODY_MAX_BYTES) {
+    try {
+      body.cancel().catch(() => {});
+    } catch {
+      // Diagnostics must remain best-effort and bounded.
+    }
+    return diagnostic;
+  }
+
+  const reader = body.getReader();
+  const chunks = [];
+  let totalBytes = 0;
+  let complete = false;
+  const deadline = Date.now() + GEMINI_TTS_ERROR_BODY_TIMEOUT_MS;
+  try {
+    while (true) {
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= 0) break;
+      let timer;
+      const timedRead = new Promise((resolve) => {
+        timer = setTimeout(() => resolve({ timedOut: true }), remainingMs);
+      });
+      const result = await Promise.race([reader.read(), timedRead]).finally(() => clearTimeout(timer));
+      if (result.timedOut) break;
+      if (result.done) {
+        complete = true;
+        break;
+      }
+      if (totalBytes + result.value.byteLength > GEMINI_TTS_ERROR_BODY_MAX_BYTES) break;
+      chunks.push(Buffer.from(result.value));
+      totalBytes += result.value.byteLength;
+    }
+  } catch {
+    // Provider diagnostics are best-effort; public error mapping remains status-based.
+  } finally {
+    if (!complete) {
+      try {
+        reader.cancel().catch(() => {});
+      } catch {
+        // The body may already have been cancelled by the linked request signal.
+      }
+    }
+    try {
+      reader.releaseLock();
+    } catch {
+      // A pending read can remain while cancellation propagates; do not delay the response.
+    }
+  }
+
+  if (!complete || !totalBytes) return diagnostic;
+  let payload;
+  try {
+    payload = JSON.parse(Buffer.concat(chunks, totalBytes).toString('utf8'));
+  } catch {
+    return diagnostic;
+  }
+  const providerError = payload?.error;
+  if (!providerError || typeof providerError !== 'object' || Array.isArray(providerError)) return diagnostic;
+  diagnostic.errorStatus = safeGeminiTtsErrorCode(providerError.status);
+  diagnostic.errorCode = safeGeminiTtsErrorCode(providerError.code);
+  return diagnostic;
+}
+
+function logGeminiTtsProviderError(httpStatus, diagnostic) {
+  console.warn('[lumora] Gemini TTS provider rejection', JSON.stringify({
+    httpStatus,
+    googleErrorStatus: diagnostic.errorStatus,
+    googleErrorCode: diagnostic.errorCode,
+  }));
+}
+
+async function readBoundedGeminiJson(response) {
+  const contentLength = Number(response.headers.get('content-length'));
+  if (Number.isFinite(contentLength) && contentLength > GEMINI_TTS_MAX_RESPONSE_BYTES) {
+    await response.body?.cancel().catch(() => {});
+    throw new HttpError(502, 'tts_invalid_response', 'The speech provider returned an invalid audio response.');
+  }
+  if (!response.body) throw new HttpError(502, 'tts_invalid_response', 'The speech provider returned an empty response.');
+
+  const reader = response.body.getReader();
+  const chunks = [];
+  let totalBytes = 0;
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      totalBytes += value.byteLength;
+      if (totalBytes > GEMINI_TTS_MAX_RESPONSE_BYTES) {
+        await reader.cancel().catch(() => {});
+        throw new HttpError(502, 'tts_invalid_response', 'The speech provider returned an invalid audio response.');
+      }
+      chunks.push(Buffer.from(value));
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  try {
+    return JSON.parse(Buffer.concat(chunks, totalBytes).toString('utf8'));
+  } catch {
+    throw new HttpError(502, 'tts_invalid_response', 'The speech provider returned an invalid audio response.');
+  }
+}
+
+function providerAudioContent(interaction) {
+  for (const step of Array.isArray(interaction?.steps) ? interaction.steps : []) {
+    if (step?.type !== 'model_output' || !Array.isArray(step.content)) continue;
+    const audio = step.content.find((item) => item?.type === 'audio');
+    if (audio) return audio;
+  }
+  return null;
+}
+
+function decodeTtsAudioData(data) {
+  const maxBase64Length = Math.ceil(GEMINI_TTS_MAX_AUDIO_BYTES / 3) * 4;
+  if (typeof data !== 'string' || data.length === 0 || data.length > maxBase64Length || !/^[A-Za-z0-9+/]*={0,2}$/.test(data) || data.length % 4 === 1) {
+    throw new HttpError(502, 'tts_invalid_audio', 'The speech provider returned invalid audio.');
+  }
+  const audio = Buffer.from(data, 'base64');
+  if (!audio.length || audio.length > GEMINI_TTS_MAX_AUDIO_BYTES || audio.toString('base64').replace(/=+$/, '') !== data.replace(/=+$/, '')) {
+    throw new HttpError(502, 'tts_invalid_audio', 'The speech provider returned invalid audio.');
+  }
+  return audio;
+}
+
+function validWav(buffer) {
+  if (!Buffer.isBuffer(buffer) || buffer.length < 44 || buffer.toString('ascii', 0, 4) !== 'RIFF' || buffer.toString('ascii', 8, 12) !== 'WAVE') return false;
+  if (buffer.readUInt32LE(4) !== buffer.length - 8) return false;
+
+  let format = null;
+  let dataLength = null;
+  let offset = 12;
+  while (offset < buffer.length) {
+    if (buffer.length - offset < 8) return false;
+    const chunkId = buffer.toString('ascii', offset, offset + 4);
+    const chunkLength = buffer.readUInt32LE(offset + 4);
+    const chunkStart = offset + 8;
+    const chunkEnd = chunkStart + chunkLength;
+    const nextChunk = chunkEnd + (chunkLength % 2);
+    if (chunkEnd > buffer.length || nextChunk > buffer.length) return false;
+
+    if (chunkId === 'fmt ') {
+      if (format || chunkLength < 16 || chunkLength === 17) return false;
+      const encoding = buffer.readUInt16LE(chunkStart);
+      const channels = buffer.readUInt16LE(chunkStart + 2);
+      const sampleRate = buffer.readUInt32LE(chunkStart + 4);
+      const byteRate = buffer.readUInt32LE(chunkStart + 8);
+      const blockAlign = buffer.readUInt16LE(chunkStart + 12);
+      const bitsPerSample = buffer.readUInt16LE(chunkStart + 14);
+      const expectedBlockAlign = channels * 2;
+      if (
+        encoding !== 1 ||
+        ![1, 2].includes(channels) ||
+        !Number.isInteger(sampleRate) ||
+        sampleRate < 8_000 ||
+        sampleRate > 96_000 ||
+        bitsPerSample !== 16 ||
+        blockAlign !== expectedBlockAlign ||
+        byteRate !== sampleRate * expectedBlockAlign
+      ) return false;
+      if (chunkLength >= 18 && 18 + buffer.readUInt16LE(chunkStart + 16) !== chunkLength) return false;
+      format = { blockAlign };
+    } else if (chunkId === 'data') {
+      if (dataLength !== null || chunkLength === 0) return false;
+      dataLength = chunkLength;
+    }
+
+    offset = nextChunk;
+  }
+
+  return Boolean(format && dataLength !== null && dataLength % format.blockAlign === 0);
+}
+
+function pcm16ToWav(pcm, audioMetadata = {}) {
+  const sampleRate = audioMetadata.sample_rate === undefined ? 24_000 : audioMetadata.sample_rate;
+  const channels = audioMetadata.channels === undefined ? 1 : audioMetadata.channels;
+  if (!Number.isInteger(sampleRate) || sampleRate < 8_000 || sampleRate > 96_000 || !Number.isInteger(channels) || channels < 1 || channels > 2 || pcm.length % (channels * 2) !== 0 || pcm.length > GEMINI_TTS_MAX_AUDIO_BYTES - 44) {
+    throw new HttpError(502, 'tts_invalid_audio', 'The speech provider returned invalid audio.');
+  }
+
+  const wav = Buffer.allocUnsafe(44 + pcm.length);
+  wav.write('RIFF', 0, 'ascii');
+  wav.writeUInt32LE(36 + pcm.length, 4);
+  wav.write('WAVE', 8, 'ascii');
+  wav.write('fmt ', 12, 'ascii');
+  wav.writeUInt32LE(16, 16);
+  wav.writeUInt16LE(1, 20);
+  wav.writeUInt16LE(channels, 22);
+  wav.writeUInt32LE(sampleRate, 24);
+  wav.writeUInt32LE(sampleRate * channels * 2, 28);
+  wav.writeUInt16LE(channels * 2, 32);
+  wav.writeUInt16LE(16, 34);
+  wav.write('data', 36, 'ascii');
+  wav.writeUInt32LE(pcm.length, 40);
+  pcm.copy(wav, 44);
+  return wav;
+}
+
+function toMobileWav(audioMetadata) {
+  const mimeType = typeof audioMetadata?.mime_type === 'string' ? audioMetadata.mime_type.trim().toLowerCase() : '';
+  const data = decodeTtsAudioData(audioMetadata?.data);
+  if (mimeType === 'audio/wav' && validWav(data)) return data;
+  if (mimeType === 'audio/l16') return pcm16ToWav(data, audioMetadata);
+  throw new HttpError(502, 'tts_invalid_audio', 'The speech provider returned an unsupported or invalid audio format.');
+}
+
+async function handleGeminiTts(req, res) {
+  let link;
+  try {
+    if (typeof req.body?.text !== 'string' || !req.body.text.trim())
+      throw new HttpError(400, 'tts_text_required', 'Provide non-empty text to speak.');
+    const text = req.body.text.trim();
+    if (text.length > GEMINI_TTS_MAX_TEXT_CHARS)
+      throw new HttpError(413, 'tts_text_too_long', `Text exceeds the ${GEMINI_TTS_MAX_TEXT_CHARS}-character speech limit.`);
+    if (!GEMINI_API_KEY) throw new HttpError(503, 'tts_not_configured', 'Speech generation is not configured on the server.');
+    if (!GEMINI_TTS_MODELS.has(GEMINI_TTS_MODEL) || !/^[A-Za-z0-9_-]{1,128}$/.test(GEMINI_TTS_VOICE))
+      throw new HttpError(503, 'tts_not_configured', 'Speech generation has an invalid model or voice configuration.');
+
+    link = linkedController(req.geminiTtsSignal, GEMINI_TTS_TIMEOUT_MS);
+    let upstream;
+    try {
+      upstream = await fetch(geminiTtsUrl(), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_API_KEY },
+        body: JSON.stringify({
+          model: GEMINI_TTS_MODEL,
+          input: [{ type: 'user_input', content: [{ type: 'text', text }] }],
+          response_format: { type: 'audio', mime_type: 'audio/wav' },
+          generation_config: { speech_config: [{ voice: GEMINI_TTS_VOICE }] },
+        }),
+        signal: link.ctrl.signal,
+      });
+    } catch (error) {
+      if (link.state.timedOut) throw new HttpError(504, 'tts_timeout', 'Speech generation took too long. Please try again.');
+      if (req.geminiTtsSignal?.aborted) throw new HttpError(499, 'aborted', 'Request cancelled.');
+      throw new HttpError(502, 'tts_provider_unavailable', 'The speech provider could not be reached. Please try again shortly.');
+    }
+
+    if (!upstream.ok) {
+      const providerError = geminiTtsProviderError(upstream.status);
+      const diagnostics = await readGeminiTtsErrorDiagnostics(upstream);
+      logGeminiTtsProviderError(upstream.status, diagnostics);
+      if (req.geminiTtsSignal?.aborted || res.destroyed || res.writableEnded) return;
+      sendError(res, providerError);
+      return;
+    }
+    const interaction = await readBoundedGeminiJson(upstream);
+    if (interaction?.status !== 'completed')
+      throw new HttpError(502, 'tts_provider_incomplete', 'The speech provider did not complete audio generation.');
+    const audio = toMobileWav(providerAudioContent(interaction));
+    res.status(200);
+    res.set({
+      'Content-Type': 'audio/wav',
+      'Content-Length': String(audio.length),
+      'Content-Disposition': 'inline; filename="lumora-speech.wav"',
+      'Cache-Control': 'no-store',
+      'X-Content-Type-Options': 'nosniff',
+    });
+    res.end(audio);
+  } catch (error) {
+    if (req.geminiTtsSignal?.aborted || res.destroyed || res.writableEnded) return;
+    if (link?.state.timedOut) return sendError(res, new HttpError(504, 'tts_timeout', 'Speech generation took too long. Please try again.'));
+    sendError(res, error instanceof HttpError ? error : new HttpError(502, 'tts_provider_unavailable', 'Speech generation is temporarily unavailable. Please try again shortly.'));
+  } finally {
+    link?.dispose();
+  }
+}
 
 const asyncRoute = (fn) => (req, res) => Promise.resolve(fn(req, res)).catch((e) => sendError(res, e));
 
@@ -1923,6 +2289,7 @@ app.post('/api/tools/news', toolLimiter, toolRoute((b, s) => getNews(b.query, s)
 app.post('/api/tools/weather', toolLimiter, toolRoute((b, s) => getWeather(b.location, s)));
 app.post('/api/tools/crypto', toolLimiter, toolRoute((b, s) => getCrypto(Array.isArray(b.assets) ? b.assets : [], s)));
 app.post('/api/tools/currency', toolLimiter, toolRoute((b, s) => getCurrency({ from: b.from, to: b.to, amount: b.amount ?? 1 }, s)));
+app.post('/api/tts', geminiTtsLimiter, reserveGeminiTtsSlot, attachGeminiTtsCancellation, handleGeminiTts);
 
 app.use((req, res) => sendError(res, new HttpError(404, 'not_found', 'Endpoint not found.')));
 // eslint-disable-next-line no-unused-vars

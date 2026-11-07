@@ -15,6 +15,45 @@ const WEATHER_MOCK = path.join(path.dirname(path.dirname(fileURLToPath(import.me
 const TOKEN = '0123456789abcdef0123456789abcdef';
 const TAVILY_TEST_KEY = 'offline-tavily-test-key';
 
+function mockWavBytes({
+  includeFmt = true,
+  includeData = true,
+  encoding = 1,
+  channels = 1,
+  sampleRate = 24_000,
+  bitsPerSample = 16,
+  blockAlign = channels * 2,
+  byteRate = sampleRate * blockAlign,
+  dataChunkLength,
+  riffSize,
+} = {}) {
+  const pcm = Buffer.from([10, 20, 30, 40, 50, 60, 70, 80]);
+  const chunk = (id, bytes, declaredSize = bytes.length) => {
+    const result = Buffer.alloc(8 + bytes.length + (bytes.length % 2));
+    result.write(id, 0, 'ascii');
+    result.writeUInt32LE(declaredSize, 4);
+    bytes.copy(result, 8);
+    return result;
+  };
+  const fmt = Buffer.alloc(16);
+  fmt.writeUInt16LE(encoding, 0);
+  fmt.writeUInt16LE(channels, 2);
+  fmt.writeUInt32LE(sampleRate, 4);
+  fmt.writeUInt32LE(byteRate, 8);
+  fmt.writeUInt16LE(blockAlign, 12);
+  fmt.writeUInt16LE(bitsPerSample, 14);
+  const chunks = [];
+  if (includeFmt) chunks.push(chunk('fmt ', fmt));
+  if (includeData) chunks.push(chunk('data', pcm, dataChunkLength ?? pcm.length));
+  const body = Buffer.concat(chunks);
+  const wav = Buffer.alloc(12 + body.length);
+  wav.write('RIFF', 0, 'ascii');
+  wav.writeUInt32LE(riffSize ?? wav.length - 8, 4);
+  wav.write('WAVE', 8, 'ascii');
+  body.copy(wav, 12);
+  return wav;
+}
+
 function mockCompletion(body, last) {
   const system = body.messages.find((message) => message.role === 'system')?.content || '';
   if (/conflicting current product prices/i.test(system)) return 'I found conflicting current prices. Which source listing should I use before converting?';
@@ -42,7 +81,7 @@ function mockCompletion(body, last) {
 }
 
 // ─── Mock provider ──────────────────────────────────────────────────────────
-const provider = { calls: [], aborted: 0, port: 0, fxCalls: 0 };
+const provider = { calls: [], ttsCalls: [], aborted: 0, abortedTts: 0, port: 0, fxCalls: 0 };
 const mock = http.createServer((req, res) => {
   if (req.url === '/__test__/fx-hit' && req.method === 'POST') {
     provider.fxCalls += 1;
@@ -52,6 +91,87 @@ const mock = http.createServer((req, res) => {
   if (req.url.endsWith('/models')) {
     res.setHeader('content-type', 'application/json');
     res.end(JSON.stringify({ data: [{ id: 'openai/gpt-oss-20b' }, { id: 'qwen/qwen3.8-27b' }] }));
+    return;
+  }
+  if (req.url === '/v1beta/interactions' && req.method === 'POST') {
+    const chunks = [];
+    req.on('data', (chunk) => chunks.push(chunk));
+    req.on('end', () => {
+      let body;
+      try {
+        body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+      } catch {
+        res.writeHead(400).end('{"error":"PROVIDER_PRIVATE_SENTINEL"}');
+        return;
+      }
+      const text = body.input?.[0]?.content?.find((item) => item.type === 'text')?.text || '';
+      const voice = body.generation_config?.speech_config?.[0]?.voice;
+      provider.ttsCalls.push({
+        model: body.model,
+        text,
+        voice,
+        responseFormat: body.response_format,
+        apiKeyPresent: /^\S+$/.test(req.headers['x-goog-api-key'] || ''),
+        bearerPresent: !!req.headers.authorization,
+      });
+
+      if (text.includes('TTS_HTTP_400_DIAGNOSTIC')) {
+        const message = `Invalid voice for submitted text ${text}; api_key=${req.headers['x-goog-api-key']}; Authorization: Bearer client-token-sensitive-sentinel; URL https://private.example/path?token=url-token-sentinel`;
+        return res.writeHead(400, { 'content-type': 'application/json' }).end(JSON.stringify({ error: { code: 400, status: 'INVALID_ARGUMENT', message } }));
+      }
+      if (text.includes('TTS_HTTP_400_PARTIAL_ECHO')) {
+        return res.writeHead(400, { 'content-type': 'application/json' }).end(JSON.stringify({
+          error: { code: 400, status: 'INVALID_ARGUMENT', message: 'Provider rejected phrase SPEECH_FRAGMENT_MUST_NOT_BE_LOGGED.' },
+        }));
+      }
+      if (text.includes('TTS_HTTP_400_OVERSIZED')) {
+        const payload = Buffer.from(JSON.stringify({ error: { code: 400, status: 'INVALID_ARGUMENT', message: `BODY_SENTINEL ${'x'.repeat(9000)}` } }));
+        return res.writeHead(400, { 'content-type': 'application/json', 'content-length': String(payload.length) }).end(payload);
+      }
+      if (text.includes('TTS_HTTP_400_DELAYED_BODY')) {
+        const payload = JSON.stringify({ error: { code: 400, status: 'INVALID_ARGUMENT', message: 'Delayed private provider message.' } });
+        res.writeHead(400, { 'content-type': 'application/json', 'content-length': String(Buffer.byteLength(payload)) });
+        res.flushHeaders();
+        const timer = setTimeout(() => res.end(payload), 1_500);
+        res.on('close', () => clearTimeout(timer));
+        return;
+      }
+      if (text.includes('TTS_HTTP_401')) return res.writeHead(401).end('{"error":"PROVIDER_PRIVATE_SENTINEL"}');
+      if (text.includes('TTS_HTTP_429')) return res.writeHead(429).end('{"error":"PROVIDER_PRIVATE_SENTINEL"}');
+      if (text.includes('TTS_HTTP_500')) return res.writeHead(500).end('{"error":"PROVIDER_PRIVATE_SENTINEL"}');
+      const respond = () => {
+        if (res.destroyed) return;
+        let audio;
+        if (text.includes('TTS_BAD_BASE64')) audio = { type: 'audio', mime_type: 'audio/wav', data: 'not*base64' };
+        else if (text.includes('TTS_BAD_WAV')) audio = { type: 'audio', mime_type: 'audio/wav', data: Buffer.from('not a wav').toString('base64') };
+        else if (text.includes('TTS_WAV_MISSING_FMT')) audio = { type: 'audio', mime_type: 'audio/wav', data: mockWavBytes({ includeFmt: false }).toString('base64') };
+        else if (text.includes('TTS_WAV_MISSING_DATA')) audio = { type: 'audio', mime_type: 'audio/wav', data: mockWavBytes({ includeData: false }).toString('base64') };
+        else if (text.includes('TTS_WAV_BAD_CHUNK_SIZE')) audio = { type: 'audio', mime_type: 'audio/wav', data: mockWavBytes({ dataChunkLength: 100 }).toString('base64') };
+        else if (text.includes('TTS_WAV_BAD_RIFF_SIZE')) audio = { type: 'audio', mime_type: 'audio/wav', data: mockWavBytes({ riffSize: 1 }).toString('base64') };
+        else if (text.includes('TTS_WAV_UNSUPPORTED_FORMAT')) audio = { type: 'audio', mime_type: 'audio/wav', data: mockWavBytes({ encoding: 3 }).toString('base64') };
+        else if (text.includes('TTS_WAV_UNSUPPORTED_CHANNELS')) audio = { type: 'audio', mime_type: 'audio/wav', data: mockWavBytes({ channels: 3, blockAlign: 6, byteRate: 144_000 }).toString('base64') };
+        else if (text.includes('TTS_WAV_BAD_SAMPLE_RATE')) audio = { type: 'audio', mime_type: 'audio/wav', data: mockWavBytes({ sampleRate: 0, byteRate: 0 }).toString('base64') };
+        else if (text.includes('TTS_WAV_BAD_BIT_DEPTH')) audio = { type: 'audio', mime_type: 'audio/wav', data: mockWavBytes({ bitsPerSample: 8 }).toString('base64') };
+        else if (text.includes('TTS_WAV_BAD_BYTE_RATE')) audio = { type: 'audio', mime_type: 'audio/wav', data: mockWavBytes({ byteRate: 47_999 }).toString('base64') };
+        else if (text.includes('TTS_WAV_BAD_BLOCK_ALIGN')) audio = { type: 'audio', mime_type: 'audio/wav', data: mockWavBytes({ blockAlign: 4 }).toString('base64') };
+        else if (text.includes('TTS_PCM')) audio = { type: 'audio', mime_type: 'audio/l16', data: Buffer.from([1, 2, 3, 4, 5, 6, 7, 8]).toString('base64'), sample_rate: 16_000, channels: 1 };
+        else audio = { type: 'audio', mime_type: 'audio/wav', data: mockWavBytes().toString('base64') };
+        res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ status: 'completed', steps: [{ type: 'model_output', content: [audio] }] }));
+      };
+      if (text.includes('TTS_DELAY')) {
+        let completed = false;
+        const timer = setTimeout(() => {
+          completed = true;
+          respond();
+        }, 1_500);
+        res.on('close', () => {
+          clearTimeout(timer);
+          if (!completed) provider.abortedTts += 1;
+        });
+        return;
+      }
+      respond();
+    });
     return;
   }
   let raw = '';
@@ -105,14 +225,15 @@ function startServer(env) {
   return new Promise((resolve, reject) => {
     const port = 20000 + Math.floor(Math.random() * 20000);
     const child = spawn(process.execPath, ['--require', WEATHER_MOCK, SERVER], {
-      env: { PATH: process.env.PATH, PORT: String(port), NODE_ENV: 'test', DOTENV_CONFIG_PATH: '/dev/null', TRUST_PROXY: '', LLM_BASE_URL: `http://127.0.0.1:${provider.port}/v1`, LLM_API_KEY: 'sk-secret-test-value', TAVILY_API_KEY: '', LUMORA_TEST_FX_OBSERVER_URL: `http://127.0.0.1:${provider.port}/__test__/fx-hit`, ...env },
+      env: { PATH: process.env.PATH, PORT: String(port), NODE_ENV: 'test', DOTENV_CONFIG_PATH: '/dev/null', TRUST_PROXY: '', LLM_BASE_URL: `http://127.0.0.1:${provider.port}/v1`, LLM_API_KEY: 'sk-secret-test-value', TAVILY_API_KEY: '', LUMORA_TEST_GEMINI_TTS_URL: `http://127.0.0.1:${provider.port}/v1beta/interactions`, LUMORA_TEST_FX_OBSERVER_URL: `http://127.0.0.1:${provider.port}/__test__/fx-hit`, ...env },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     children.push(child);
     let out = '';
+    child.getOutput = () => out;
     const onData = (d) => {
       out += d;
-      if (out.includes('listening')) resolve({ url: `http://127.0.0.1:${port}`, child, output: out });
+      if (out.includes('listening')) resolve({ url: `http://127.0.0.1:${port}`, child, output: out, getOutput: () => out });
     };
     child.stdout.on('data', onData);
     child.stderr.on('data', (d) => (out += d));
@@ -121,6 +242,7 @@ function startServer(env) {
 }
 
 const auth = { Authorization: `Bearer ${TOKEN}`, 'Content-Type': 'application/json' };
+const ttsBody = (text) => JSON.stringify({ text });
 const chatBody = (content, extra = {}) => JSON.stringify({ model: 'gpt-oss-20b', messages: [{ role: 'user', content }], ...extra });
 const chatConversationBody = (messages, extra = {}) => JSON.stringify({ model: 'gpt-oss-20b', messages, ...extra });
 
@@ -132,6 +254,14 @@ function parseSSE(text) {
       const [e, d] = b.split('\n');
       return { event: e.slice(7), data: JSON.parse(d.slice(6)) };
     });
+}
+
+async function waitForCondition(predicate, timeoutMs = 3_000) {
+  const started = Date.now();
+  while (!predicate()) {
+    if (Date.now() - started > timeoutMs) throw new Error('Timed out waiting for test condition.');
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
 }
 
 async function requestGoldResponse(url, messages, streaming) {
@@ -199,6 +329,7 @@ test('protected chat and tool routes reject missing, invalid, and malformed bear
     { method: 'POST', url: `${api}/api/tools/weather`, body: '{}' },
     { method: 'POST', url: `${api}/api/tools/crypto`, body: '{}' },
     { method: 'POST', url: `${api}/api/tools/currency`, body: '{}' },
+    { method: 'POST', url: `${api}/api/tts`, body: '{}' },
   ];
   const malformed = ['Basic token', 'Bearer', 'Bearer  ' + TOKEN, `Bearer ${TOKEN} extra`];
   for (const route of routes) {
@@ -224,6 +355,269 @@ test('protected chat and tool routes reject missing, invalid, and malformed bear
   const tool = await fetch(`${api}/api/tools/search`, { method: 'POST', headers: auth, body: JSON.stringify({ query: 'test' }) });
   assert.equal(tool.status, 503); // authenticated; Tavily is intentionally unset in this test server
   assert.equal((await tool.json()).error.code, 'search_not_configured');
+});
+
+test('Gemini TTS uses the configured model and voice and returns WAV bytes without leaking credentials', async () => {
+  const { url, child } = await startServer({
+    LUMORA_CLIENT_TOKENS: TOKEN,
+    GEMINI_API_KEY: 'gemini-test-secret-value',
+    GEMINI_TTS_RATE_PER_MIN: '1000',
+  });
+  const before = provider.ttsCalls.length;
+  const response = await fetch(`${url}/api/tts`, { method: 'POST', headers: auth, body: ttsBody('  Hello, welcome to Lumora AI.  ') });
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get('content-type'), 'audio/wav');
+  assert.equal(response.headers.get('cache-control'), 'no-store');
+  assert.equal(response.headers.get('x-content-type-options'), 'nosniff');
+  assert.equal(response.headers.get('content-disposition'), 'inline; filename="lumora-speech.wav"');
+  const audio = Buffer.from(await response.arrayBuffer());
+  assert.deepEqual(audio, mockWavBytes());
+  assert.equal(Number(response.headers.get('content-length')), audio.length);
+  assert.equal(provider.ttsCalls.length, before + 1);
+  assert.deepEqual(provider.ttsCalls.at(-1), {
+    model: 'gemini-3.8-flash-tts',
+    text: 'Hello, welcome to Lumora AI.',
+    voice: 'Nika',
+    responseFormat: { type: 'audio', mime_type: 'audio/wav' },
+    apiKeyPresent: true,
+    bearerPresent: false,
+  });
+  assert.doesNotMatch(child.getOutput(), /gemini-test-secret-value|Hello, welcome to Lumora AI/);
+});
+
+test('Gemini TTS rejects empty, invalid, and oversized text without contacting Google', async () => {
+  const { url } = await startServer({
+    LUMORA_CLIENT_TOKENS: TOKEN,
+    GEMINI_API_KEY: 'gemini-test-secret-value',
+    GEMINI_TTS_MAX_TEXT_CHARS: '8',
+    GEMINI_TTS_RATE_PER_MIN: '1000',
+  });
+  const before = provider.ttsCalls.length;
+  for (const body of [JSON.stringify({ text: '' }), JSON.stringify({ text: '   ' }), JSON.stringify({ text: 42 })]) {
+    const response = await fetch(`${url}/api/tts`, { method: 'POST', headers: auth, body });
+    assert.equal(response.status, 400);
+    assert.equal((await response.json()).error.code, 'tts_text_required');
+  }
+  const tooLong = await fetch(`${url}/api/tts`, { method: 'POST', headers: auth, body: ttsBody('123456789') });
+  assert.equal(tooLong.status, 413);
+  assert.equal((await tooLong.json()).error.code, 'tts_text_too_long');
+  assert.equal(provider.ttsCalls.length, before);
+});
+
+test('Gemini TTS fails safely when its separate API key is not configured', async () => {
+  const { url } = await startServer({ LUMORA_CLIENT_TOKENS: TOKEN, GEMINI_API_KEY: '', GEMINI_TTS_RATE_PER_MIN: '1000' });
+  const before = provider.ttsCalls.length;
+  const response = await fetch(`${url}/api/tts`, { method: 'POST', headers: auth, body: ttsBody('Hello.') });
+  assert.equal(response.status, 503);
+  assert.equal((await response.json()).error.code, 'tts_not_configured');
+  assert.equal(provider.ttsCalls.length, before);
+});
+
+test('Gemini TTS maps provider authentication, rate-limit, and service errors without leaking provider details', async () => {
+  const { url, child } = await startServer({
+    LUMORA_CLIENT_TOKENS: TOKEN,
+    GEMINI_API_KEY: 'gemini-test-secret-value',
+    GEMINI_TTS_RATE_PER_MIN: '1000',
+  });
+  const cases = [
+    { text: 'TTS_HTTP_401', status: 502, code: 'tts_provider_auth' },
+    { text: 'TTS_HTTP_429', status: 503, code: 'tts_rate_limited' },
+    { text: 'TTS_HTTP_500', status: 502, code: 'tts_provider_unavailable' },
+  ];
+  for (const item of cases) {
+    const response = await fetch(`${url}/api/tts`, { method: 'POST', headers: auth, body: ttsBody(item.text) });
+    const body = await response.text();
+    assert.equal(response.status, item.status);
+    assert.equal(JSON.parse(body).error.code, item.code);
+    assert.doesNotMatch(body, /PROVIDER_PRIVATE_SENTINEL|gemini-test-secret-value|TTS_HTTP_/);
+  }
+  assert.doesNotMatch(child.getOutput(), /PROVIDER_PRIVATE_SENTINEL|gemini-test-secret-value|TTS_HTTP_/);
+});
+
+test('Gemini TTS provider rejection logs bounded structured diagnostics with sensitive content redacted', async () => {
+  const { url, child } = await startServer({
+    LUMORA_CLIENT_TOKENS: TOKEN,
+    GEMINI_API_KEY: 'gemini-test-secret-value',
+    GEMINI_TTS_RATE_PER_MIN: '1000',
+  });
+  const speechText = 'TTS_HTTP_400_DIAGNOSTIC USER_SPEECH_SENTINEL';
+  const response = await fetch(`${url}/api/tts`, { method: 'POST', headers: auth, body: ttsBody(speechText) });
+  assert.equal(response.status, 502);
+  assert.deepEqual(await response.json(), {
+    error: { code: 'tts_provider_rejected', message: 'The speech provider could not process this request. Check the configured model and voice.' },
+  });
+
+  const logs = child.getOutput();
+  const diagnosticLine = logs.match(/\[lumora\] Gemini TTS provider rejection (\{[^\n]*\})/);
+  assert.ok(diagnosticLine, 'provider rejection diagnostic should be logged');
+  assert.deepEqual(JSON.parse(diagnosticLine[1]), {
+    httpStatus: 400,
+    googleErrorStatus: 'INVALID_ARGUMENT',
+    googleErrorCode: 400,
+  });
+  assert.doesNotMatch(logs, /USER_SPEECH_SENTINEL|Invalid voice for submitted text|gemini-test-secret-value|client-token-sensitive-sentinel|url-token-sentinel|private\.example|private-query|redacted speech text/);
+});
+
+test('Gemini TTS logs no provider message when it echoes only a substring of submitted speech', async () => {
+  const { url, child } = await startServer({
+    LUMORA_CLIENT_TOKENS: TOKEN,
+    GEMINI_API_KEY: 'gemini-test-secret-value',
+    GEMINI_TTS_RATE_PER_MIN: '1000',
+  });
+  const speechText = 'TTS_HTTP_400_PARTIAL_ECHO SPEECH_FRAGMENT_MUST_NOT_BE_LOGGED';
+  const response = await fetch(`${url}/api/tts`, { method: 'POST', headers: auth, body: ttsBody(speechText) });
+  assert.equal(response.status, 502);
+  assert.deepEqual(await response.json(), {
+    error: { code: 'tts_provider_rejected', message: 'The speech provider could not process this request. Check the configured model and voice.' },
+  });
+
+  const logs = child.getOutput();
+  const diagnosticLine = logs.match(/\[lumora\] Gemini TTS provider rejection (\{[^\n]*\})/);
+  assert.ok(diagnosticLine, 'provider rejection diagnostic should be logged');
+  assert.deepEqual(JSON.parse(diagnosticLine[1]), {
+    httpStatus: 400,
+    googleErrorStatus: 'INVALID_ARGUMENT',
+    googleErrorCode: 400,
+  });
+  assert.doesNotMatch(logs, /SPEECH_FRAGMENT_MUST_NOT_BE_LOGGED|TTS_HTTP_400_PARTIAL_ECHO|Provider rejected phrase/);
+});
+
+test('Gemini TTS diagnostics skip oversized bodies and stop reading stalled provider errors within a bound', async () => {
+  const { url, child } = await startServer({
+    LUMORA_CLIENT_TOKENS: TOKEN,
+    GEMINI_API_KEY: 'gemini-test-secret-value',
+    GEMINI_TTS_TIMEOUT_MS: '10000',
+    GEMINI_TTS_RATE_PER_MIN: '1000',
+  });
+  for (const text of ['TTS_HTTP_400_OVERSIZED', 'TTS_HTTP_400_DELAYED_BODY']) {
+    const start = Date.now();
+    const response = await fetch(`${url}/api/tts`, { method: 'POST', headers: auth, body: ttsBody(text) });
+    assert.equal(response.status, 502);
+    assert.equal((await response.json()).error.code, 'tts_provider_rejected');
+    assert.ok(Date.now() - start < 2_000, 'provider error body processing should be bounded');
+  }
+  const logs = child.getOutput();
+  assert.match(logs, /"httpStatus":400/);
+  assert.doesNotMatch(logs, /BODY_SENTINEL|Delayed private provider message|gemini-test-secret-value/);
+});
+
+test('Gemini TTS wraps documented raw PCM metadata into a valid WAV and rejects malformed audio', async () => {
+  const { url } = await startServer({
+    LUMORA_CLIENT_TOKENS: TOKEN,
+    GEMINI_API_KEY: 'gemini-test-secret-value',
+    GEMINI_TTS_RATE_PER_MIN: '1000',
+  });
+  const pcmResponse = await fetch(`${url}/api/tts`, { method: 'POST', headers: auth, body: ttsBody('TTS_PCM') });
+  assert.equal(pcmResponse.status, 200);
+  const wav = Buffer.from(await pcmResponse.arrayBuffer());
+  assert.equal(wav.toString('ascii', 0, 4), 'RIFF');
+  assert.equal(wav.toString('ascii', 8, 12), 'WAVE');
+  assert.equal(wav.readUInt32LE(24), 16_000);
+  assert.equal(wav.readUInt16LE(22), 1);
+  assert.equal(wav.readUInt16LE(34), 16);
+  assert.deepEqual(wav.subarray(44), Buffer.from([1, 2, 3, 4, 5, 6, 7, 8]));
+
+  for (const text of [
+    'TTS_BAD_BASE64',
+    'TTS_BAD_WAV',
+    'TTS_WAV_MISSING_FMT',
+    'TTS_WAV_MISSING_DATA',
+    'TTS_WAV_BAD_CHUNK_SIZE',
+    'TTS_WAV_BAD_RIFF_SIZE',
+    'TTS_WAV_UNSUPPORTED_FORMAT',
+    'TTS_WAV_UNSUPPORTED_CHANNELS',
+    'TTS_WAV_BAD_SAMPLE_RATE',
+    'TTS_WAV_BAD_BIT_DEPTH',
+    'TTS_WAV_BAD_BYTE_RATE',
+    'TTS_WAV_BAD_BLOCK_ALIGN',
+  ]) {
+    const response = await fetch(`${url}/api/tts`, { method: 'POST', headers: auth, body: ttsBody(text) });
+    assert.equal(response.status, 502);
+    assert.equal((await response.json()).error.code, 'tts_invalid_audio');
+  }
+});
+
+test('Gemini TTS enforces its own rate limit and in-process concurrency bound', async () => {
+  const limited = await startServer({
+    LUMORA_CLIENT_TOKENS: TOKEN,
+    GEMINI_API_KEY: 'gemini-test-secret-value',
+    GEMINI_TTS_RATE_PER_MIN: '1',
+    API_RATE_PER_MIN: '1000',
+  });
+  const beforeRate = provider.ttsCalls.length;
+  const first = await fetch(`${limited.url}/api/tts`, { method: 'POST', headers: auth, body: ttsBody('Rate test.') });
+  assert.equal(first.status, 200);
+  const second = await fetch(`${limited.url}/api/tts`, { method: 'POST', headers: auth, body: ttsBody('Rate test again.') });
+  assert.equal(second.status, 429);
+  assert.equal((await second.json()).error.code, 'rate_limited');
+  assert.equal(provider.ttsCalls.length, beforeRate + 1);
+
+  const bounded = await startServer({
+    LUMORA_CLIENT_TOKENS: TOKEN,
+    GEMINI_API_KEY: 'gemini-test-secret-value',
+    GEMINI_TTS_RATE_PER_MIN: '1000',
+    GEMINI_TTS_MAX_CONCURRENT: '1',
+  });
+  const beforeConcurrent = provider.ttsCalls.length;
+  const pending = fetch(`${bounded.url}/api/tts`, { method: 'POST', headers: auth, body: ttsBody('TTS_DELAY') });
+  await waitForCondition(() => provider.ttsCalls.length > beforeConcurrent);
+  const rejected = await fetch(`${bounded.url}/api/tts`, { method: 'POST', headers: auth, body: ttsBody('Concurrent request.') });
+  assert.equal(rejected.status, 503);
+  assert.equal((await rejected.json()).error.code, 'tts_busy');
+  assert.equal(provider.ttsCalls.length, beforeConcurrent + 1);
+  assert.equal((await pending).status, 200);
+});
+
+test('Gemini TTS timeout aborts the provider request and returns a sanitized error', async () => {
+  const { url } = await startServer({
+    LUMORA_CLIENT_TOKENS: TOKEN,
+    GEMINI_API_KEY: 'gemini-test-secret-value',
+    GEMINI_TTS_TIMEOUT_MS: '100',
+    GEMINI_TTS_RATE_PER_MIN: '1000',
+  });
+  const before = provider.abortedTts;
+  const response = await fetch(`${url}/api/tts`, { method: 'POST', headers: auth, body: ttsBody('TTS_DELAY') });
+  assert.equal(response.status, 504);
+  assert.equal((await response.json()).error.code, 'tts_timeout');
+  await waitForCondition(() => provider.abortedTts > before);
+});
+
+test('Gemini TTS client disconnect aborts upstream and releases the concurrency slot', async () => {
+  const { url } = await startServer({
+    LUMORA_CLIENT_TOKENS: TOKEN,
+    GEMINI_API_KEY: 'gemini-test-secret-value',
+    GEMINI_TTS_TIMEOUT_MS: '10000',
+    GEMINI_TTS_MAX_CONCURRENT: '1',
+    GEMINI_TTS_RATE_PER_MIN: '1000',
+  });
+  const beforeCalls = provider.ttsCalls.length;
+  const beforeAborts = provider.abortedTts;
+  const clientAbort = new AbortController();
+  const disconnectedRequest = fetch(`${url}/api/tts`, {
+    method: 'POST',
+    headers: auth,
+    body: ttsBody('TTS_DELAY'),
+    signal: clientAbort.signal,
+  }).then(
+    () => null,
+    (error) => error,
+  );
+
+  await waitForCondition(() => provider.ttsCalls.length > beforeCalls);
+  clientAbort.abort();
+  assert.ok((await disconnectedRequest) instanceof Error, 'client request should be aborted');
+  await waitForCondition(() => provider.abortedTts > beforeAborts);
+
+  let retryResponse;
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    retryResponse = await fetch(`${url}/api/tts`, { method: 'POST', headers: auth, body: ttsBody('Retry after disconnect.') });
+    if (retryResponse.status !== 503) break;
+    const body = await retryResponse.json();
+    assert.equal(body.error.code, 'tts_busy');
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.equal(retryResponse.status, 200, 'concurrency slot should be released after disconnect');
+  assert.equal(provider.ttsCalls.length, beforeCalls + 2);
 });
 
 test('CORS: allowlisted origin only', async () => {
