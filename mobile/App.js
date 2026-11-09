@@ -14,7 +14,7 @@
  *   npx expo start
  * Dependencies (all added via `npx expo install`, SDK-matched): expo,
  * @react-native-async-storage/async-storage, expo-clipboard, expo-haptics,
- * expo-linear-gradient, expo-status-bar, expo-system-ui, expo-font,
+ * expo-audio, expo-file-system, expo-linear-gradient, expo-status-bar, expo-system-ui, expo-font,
  * expo-splash-screen, react-native-safe-area-context, @expo/vector-icons,
  * @ronradtke/react-native-markdown-display@8.1.0 (markdown-it overridden to ^14).
  *
@@ -55,6 +55,8 @@ import {
 } from 'react-native';
 import { StatusBar } from 'expo-status-bar';
 import { fetch as expoFetch } from 'expo/fetch';
+import { AudioModule, RecordingPresets, setAudioModeAsync, useAudioRecorder, useAudioRecorderState } from 'expo-audio';
+import { Directory, File, Paths, UploadType } from 'expo-file-system';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as Clipboard from 'expo-clipboard';
 import * as Haptics from 'expo-haptics';
@@ -88,6 +90,11 @@ const LIMITS = {
 };
 
 const TIMEOUTS = { connect: 30000, idle: 60000, request: 12000 };
+const VOICE_TRANSCRIPTION_TIMEOUT_MS = 120000;
+/** @type {{ allowsRecording: boolean, playsInSilentMode: boolean, interruptionMode: 'mixWithOthers' }} */
+const DEFAULT_AUDIO_MODE = { allowsRecording: false, playsInSilentMode: false, interruptionMode: 'mixWithOthers' };
+/** @type {{ allowsRecording: boolean, playsInSilentMode: boolean, interruptionMode: 'mixWithOthers' }} */
+const RECORDING_AUDIO_MODE = { allowsRecording: true, playsInSilentMode: false, interruptionMode: 'mixWithOthers' };
 const RETRY = { attempts: 3, baseMs: 700, maxMs: 6000 };
 
 const STORAGE_KEYS = {
@@ -356,6 +363,20 @@ function friendlyError(err) {
   if (status === 429) return 'Rate limit reached. Wait a moment, then try again.';
   if (status >= 500) return 'Lumora servers are having trouble right now. Please try again shortly.';
   return err.message && err.message.length < 200 ? err.message : 'Something went wrong. Tap Regenerate to try again.';
+}
+
+function voiceTranscriptionError(status, code, timedOut = false) {
+  if (timedOut || code === 'tool_timeout' || status === 504) return 'Transcription timed out. Try a shorter recording or try again.';
+  if (status === 401 || status === 403) return "Lumora couldn't verify backend access. Check the app connection and try again.";
+  if (status === 413 || code === 'payload_too_large') return 'This recording is too large. Record a shorter clip and try again.';
+  if (status === 400 || status === 415 || ['invalid_multipart', 'audio_required', 'invalid_audio', 'unsupported_audio'].includes(code)) {
+    return 'This recording could not be read. Record a new clip and try again.';
+  }
+  if (status === 429 || code === 'provider_rate_limited' || code === 'rate_limited') return 'Speech transcription is temporarily rate limited. Wait a little and try again.';
+  if (code === 'voice_busy') return 'Speech transcription is busy right now. Try again shortly.';
+  if (code === 'provider_not_configured') return 'Speech transcription is not configured on the Lumora backend yet.';
+  if (status >= 500 || String(code || '').startsWith('provider_')) return 'Speech transcription is temporarily unavailable. Please try again.';
+  return 'Could not transcribe this recording. Check your connection and try again.';
 }
 
 function normalizeFetchError(e, userSignal, timedOut, midStream) {
@@ -1872,9 +1893,274 @@ const MessageBubble = memo(/** @param {any} props */ function MessageBubble({ it
 // COMPOSER + FLOATING BUTTON
 // ═══════════════════════════════════════════════════════════════════════════
 
-const Composer = memo(/** @param {any} props */ function Composer({ value, onChangeText, onSend, onStop, isGenerating, toolsMode, onToggleTools, bottomPad, disabled }) {
-  const canSend = !!value.trim() && !disabled;
+function formatRecordingDuration(durationMillis) {
+  const totalSeconds = Math.max(0, Math.floor((Number(durationMillis) || 0) / 1000));
+  const minutes = String(Math.floor(totalSeconds / 60)).padStart(2, '0');
+  const seconds = String(totalSeconds % 60).padStart(2, '0');
+  return `${minutes}:${seconds}`;
+}
+
+const Composer = memo(/** @param {any} props */ function Composer({ value, onChangeText, onSend, onStop, onRecordingError, apiBaseUrl, isGenerating, toolsMode, onToggleTools, bottomPad, disabled }) {
+  const recorder = useAudioRecorder({ ...RecordingPresets.HIGH_QUALITY, directory: 'cache' });
+  const recorderState = useAudioRecorderState(recorder, 250);
+  const [capture, setCapture] = useState({ phase: 'idle', uri: null, durationMs: 0, progress: null, transcribed: false });
+  const captureRef = useRef(capture);
+  const inputValueRef = useRef(value);
+  const mountedRef = useRef(true);
+  const actionRef = useRef(false);
+  const uploadAbortRef = useRef(null);
+  const uploadTaskRef = useRef(null);
+  const uploadPromiseRef = useRef(null);
+  const uploadCopyRef = useRef(null);
+  const cancelUploadRef = useRef(false);
+  captureRef.current = capture;
+  inputValueRef.current = value;
+
+  const updateCapture = useCallback((next) => {
+    if (mountedRef.current) setCapture(next);
+  }, []);
+  const removeCachedFile = useCallback((uri) => {
+    if (!uri) return true;
+    try {
+      const file = new File(uri);
+      if (file.exists) file.delete();
+      return true;
+    } catch {
+      return false;
+    }
+  }, []);
+  const cleanupUploadCopy = useCallback(() => {
+    const copy = uploadCopyRef.current;
+    uploadCopyRef.current = null;
+    if (!copy) return;
+    try {
+      if (copy.directory?.exists) copy.directory.delete();
+      else if (copy.file?.exists) copy.file.delete();
+    } catch {}
+  }, []);
+
+  const startRecording = useCallback(async () => {
+    if (actionRef.current || disabled || isGenerating || captureRef.current.phase !== 'idle') return;
+    actionRef.current = true;
+    updateCapture({ phase: 'requesting', uri: null, durationMs: 0, progress: null, transcribed: false });
+    try {
+      // Ask for microphone access only in response to this explicit user tap.
+      const permission = await AudioModule.requestRecordingPermissionsAsync();
+      if (!permission?.granted) {
+        updateCapture({ phase: 'idle', uri: null, durationMs: 0, progress: null, transcribed: false });
+        onRecordingError?.('Microphone permission was denied. Allow microphone access to record.');
+        return;
+      }
+      await setAudioModeAsync(RECORDING_AUDIO_MODE);
+      await recorder.prepareToRecordAsync();
+      await recorder.record();
+      updateCapture({ phase: 'recording', uri: null, durationMs: 0, progress: null, transcribed: false });
+    } catch {
+      try { await recorder.stop(); } catch {}
+      try { await setAudioModeAsync(DEFAULT_AUDIO_MODE); } catch {}
+      updateCapture({ phase: 'idle', uri: null, durationMs: 0, progress: null, transcribed: false });
+      onRecordingError?.('Could not start microphone recording. Please try again.');
+    } finally {
+      actionRef.current = false;
+    }
+  }, [disabled, isGenerating, onRecordingError, recorder, updateCapture]);
+
+  const stopRecording = useCallback(async () => {
+    if (actionRef.current || captureRef.current.phase !== 'recording') return;
+    actionRef.current = true;
+    let recorderStopped = false;
+    try {
+      await recorder.stop();
+      recorderStopped = true;
+      const uri = recorder.uri;
+      if (!uri) throw new Error('missing_recording');
+      try { await setAudioModeAsync(DEFAULT_AUDIO_MODE); } catch {}
+      updateCapture({ phase: 'saved', uri, durationMs: recorderState.durationMillis, progress: null, transcribed: false });
+    } catch {
+      if (recorderStopped) {
+        try { await setAudioModeAsync(DEFAULT_AUDIO_MODE); } catch {}
+        updateCapture({ phase: 'idle', uri: null, durationMs: 0, progress: null, transcribed: false });
+        onRecordingError?.('The recording could not be saved to the app cache.');
+      } else {
+        onRecordingError?.('Could not stop the microphone recording. Try stopping it again.');
+      }
+    } finally {
+      actionRef.current = false;
+    }
+  }, [onRecordingError, recorder, recorderState.durationMillis, updateCapture]);
+
+  const transcribeRecording = useCallback(() => {
+    if (captureRef.current.phase !== 'saved' || uploadPromiseRef.current) return;
+    const uri = captureRef.current.uri;
+    const durationMs = captureRef.current.durationMs;
+    if (!uri) {
+      onRecordingError?.('The saved recording is unavailable. Record a new clip and try again.');
+      return;
+    }
+    if (!apiBaseUrl) {
+      onRecordingError?.('Configure the Lumora backend connection before transcribing audio.');
+      return;
+    }
+    if (!ENV.clientToken) {
+      onRecordingError?.("Lumora backend access isn't configured for this app. Please check the app connection.");
+      return;
+    }
+
+    const controller = new AbortController();
+    uploadAbortRef.current = controller;
+    cancelUploadRef.current = false;
+    updateCapture({ phase: 'transcribing', uri, durationMs, progress: null, transcribed: false });
+
+    const operation = (async () => {
+      let timedOut = false;
+      const timeout = setTimeout(() => {
+        timedOut = true;
+        controller.abort();
+      }, VOICE_TRANSCRIPTION_TIMEOUT_MS);
+      try {
+        const directory = new Directory(Paths.cache, `lumora-voice-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+        directory.create({ intermediates: true });
+        const file = new File(directory, 'recording.m4a');
+        uploadCopyRef.current = { directory, file };
+        await new File(uri).copy(file);
+        if (controller.signal.aborted) {
+          if (timedOut) throw Object.assign(new Error('timeout'), { kind: 'timeout' });
+          return;
+        }
+
+        const task = file.createUploadTask(`${apiBaseUrl}/api/voice/transcribe`, {
+          httpMethod: 'POST',
+          uploadType: UploadType.MULTIPART,
+          fieldName: 'audio',
+          mimeType: 'audio/mp4',
+          headers: buildHeaders(),
+          signal: controller.signal,
+          onProgress: ({ bytesSent, totalBytes }) => {
+            const progress = totalBytes > 0 ? Math.min(100, Math.floor((bytesSent / totalBytes) * 100)) : null;
+            if (mountedRef.current) setCapture((current) => current.phase === 'transcribing' ? { ...current, progress } : current);
+          },
+        });
+        uploadTaskRef.current = task;
+        const response = await task.uploadAsync();
+        if (controller.signal.aborted || cancelUploadRef.current) return;
+
+        let result;
+        try { result = JSON.parse(response.body); } catch {
+          if (response.status >= 200 && response.status < 300) throw Object.assign(new Error('malformed'), { kind: 'malformed' });
+        }
+        if (response.status < 200 || response.status >= 300) {
+          throw Object.assign(new Error('http'), { status: response.status, code: String(result?.error?.code || '') });
+        }
+        if (!result || typeof result.text !== 'string') throw Object.assign(new Error('malformed'), { kind: 'malformed' });
+        const transcription = result.text.trim();
+        if (!transcription) throw Object.assign(new Error('empty_transcription'), { kind: 'empty' });
+
+        const currentDraft = inputValueRef.current;
+        const nextDraft = currentDraft.trim() ? `${currentDraft.trimEnd()}\n\n${transcription}` : transcription;
+        if (nextDraft.length > LIMITS.maxInput) throw Object.assign(new Error('composer_limit'), { kind: 'composer_limit' });
+        inputValueRef.current = nextDraft;
+        onChangeText(nextDraft);
+
+        const recordingDeleted = removeCachedFile(uri);
+        updateCapture(recordingDeleted
+          ? { phase: 'idle', uri: null, durationMs: 0, progress: null, transcribed: false }
+          : { phase: 'saved', uri, durationMs, progress: null, transcribed: true });
+        if (!recordingDeleted) onRecordingError?.('Transcription added, but the temporary audio could not be deleted. Tap Cancel recording to discard it.');
+      } catch (error) {
+        if (controller.signal.aborted && !timedOut && !cancelUploadRef.current) return;
+        if (cancelUploadRef.current) return;
+        updateCapture({ phase: 'saved', uri, durationMs, progress: null, transcribed: false });
+        const message = error?.kind === 'empty'
+          ? 'No speech was detected. Try recording again in a quieter place.'
+          : error?.kind === 'malformed'
+            ? 'Lumora received an unexpected transcription response. Your recording is saved; try again.'
+            : error?.kind === 'composer_limit'
+              ? 'The transcription is too long to add to the current draft. Shorten the draft and retry.'
+              : error?.status
+                ? voiceTranscriptionError(error.status, error.code || '', timedOut)
+                : timedOut
+                  ? voiceTranscriptionError(0, '', true)
+                  : 'Could not upload the recording. Check your connection and try again.';
+        onRecordingError?.(message);
+      } finally {
+        clearTimeout(timeout);
+        try { uploadTaskRef.current?.release?.(); } catch {}
+        uploadTaskRef.current = null;
+        uploadAbortRef.current = null;
+        uploadPromiseRef.current = null;
+        cleanupUploadCopy();
+      }
+    })();
+    uploadPromiseRef.current = operation;
+    return operation;
+  }, [apiBaseUrl, cleanupUploadCopy, onChangeText, onRecordingError, removeCachedFile, updateCapture]);
+
+  const cancelRecording = useCallback(async () => {
+    const current = captureRef.current;
+    if (current.phase === 'transcribing') {
+      cancelUploadRef.current = true;
+      uploadAbortRef.current?.abort();
+      try { await uploadTaskRef.current?.cancelAsync?.(); } catch {}
+      try { await uploadPromiseRef.current; } catch {}
+      if (!removeCachedFile(current.uri)) {
+        onRecordingError?.('Could not discard the recording. It remains in the temporary app cache.');
+        updateCapture({ ...current, phase: 'saved', progress: null });
+        return;
+      }
+      updateCapture({ phase: 'idle', uri: null, durationMs: 0, progress: null, transcribed: false });
+      return;
+    }
+    if (actionRef.current || !['recording', 'saved'].includes(current.phase)) return;
+    actionRef.current = true;
+    try {
+      let uri = current.uri;
+      if (current.phase === 'recording') {
+        await recorder.stop();
+        uri = recorder.uri || uri;
+      }
+      try { await setAudioModeAsync(DEFAULT_AUDIO_MODE); } catch {}
+      if (uri && !removeCachedFile(uri)) {
+        onRecordingError?.('Could not discard the recording. It remains in the temporary app cache.');
+        updateCapture({ ...current, phase: 'saved', uri });
+        return;
+      }
+      updateCapture({ phase: 'idle', uri: null, durationMs: 0, progress: null, transcribed: false });
+    } catch {
+      onRecordingError?.('Could not cancel the microphone recording. Try stopping it again.');
+    } finally {
+      actionRef.current = false;
+    }
+  }, [onRecordingError, recorder, removeCachedFile, updateCapture]);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      uploadAbortRef.current?.abort();
+      try { uploadTaskRef.current?.cancelAsync?.(); } catch {}
+      try { recorder.stop(); } catch {}
+      void setAudioModeAsync(DEFAULT_AUDIO_MODE).catch(() => {});
+      cleanupUploadCopy();
+    };
+  }, [cleanupUploadCopy, recorder]);
+
+  const canSend = !!value.trim() && !disabled && !['recording', 'requesting', 'transcribing'].includes(capture.phase);
   const near = value.length > LIMITS.maxInput * 0.8;
+  const durationMs = capture.phase === 'recording' ? recorderState.durationMillis : capture.durationMs;
+  const voiceStatus = capture.phase === 'recording'
+    ? `Recording · ${formatRecordingDuration(durationMs)} · audio stays on this device`
+    : capture.phase === 'saved'
+      ? capture.transcribed
+        ? `Transcription added · audio remains temporarily · ${formatRecordingDuration(durationMs)}`
+        : `Recording saved temporarily · ${formatRecordingDuration(durationMs)} · ready to transcribe`
+      : capture.phase === 'requesting'
+        ? 'Requesting microphone access…'
+        : capture.phase === 'transcribing'
+          ? capture.progress == null || capture.progress < 100
+            ? `Uploading audio${capture.progress == null ? '…' : ` · ${capture.progress}%`}`
+            : 'Transcribing audio…'
+          : null;
+
   return (
     <View style={[styles.composerWrap, { paddingBottom: bottomPad }]}>
       <View style={styles.composer}>
@@ -1893,7 +2179,7 @@ const Composer = memo(/** @param {any} props */ function Composer({ value, onCha
         <TextInput
           style={styles.input}
           value={value}
-          onChangeText={onChangeText}
+          onChangeText={(text) => { inputValueRef.current = text; onChangeText(text); }}
           placeholder="Ask Lumora anything…"
           placeholderTextColor={C.muted}
           multiline
@@ -1902,19 +2188,47 @@ const Composer = memo(/** @param {any} props */ function Composer({ value, onCha
           selectionColor={C.blue}
           accessibilityLabel="Message input"
         />
+        {['recording', 'saved', 'transcribing'].includes(capture.phase) ? (
+          <PressableScale
+            onPress={cancelRecording}
+            accessibilityLabel={capture.phase === 'transcribing' ? 'Cancel transcription' : 'Cancel recording'}
+            accessibilityHint={capture.phase === 'transcribing' ? 'Aborts transcription and discards the local recording.' : 'Stops and discards the local recording.'}
+            testID="cancel-recording-button"
+            style={styles.recordingCancelBtn}
+          >
+            <Ionicons name="close" size={20} color={C.red} />
+          </PressableScale>
+        ) : (
+          <PressableScale
+            onPress={startRecording}
+            disabled={disabled || isGenerating || capture.phase === 'requesting'}
+            accessibilityLabel={capture.phase === 'requesting' ? 'Requesting microphone access' : 'Start recording'}
+            accessibilityHint="Records audio locally. It is uploaded only if you tap Transcribe."
+            testID="start-recording-button"
+            style={styles.recordingStartBtn}
+          >
+            {capture.phase === 'requesting' ? <ActivityIndicator size="small" color={C.blueBright} /> : <Ionicons name="mic-outline" size={19} color={C.text} />}
+          </PressableScale>
+        )}
         {isGenerating ? (
           <PressableScale onPress={onStop} accessibilityLabel="Stop generating" testID="stop-touch-target" style={styles.stopBtn}>
             <View style={styles.stopSquare} />
           </PressableScale>
+        ) : capture.phase === 'recording' ? (
+          <PressableScale onPress={stopRecording} accessibilityLabel="Stop recording" accessibilityHint="Finishes and keeps the recording temporarily in the app cache." testID="stop-recording-button" style={styles.recordingStopBtn}>
+            <Ionicons name="stop" size={19} color={C.white} />
+          </PressableScale>
+        ) : capture.phase === 'saved' ? (
+          <PressableScale onPress={() => { if (!capture.transcribed) void transcribeRecording(); }} disabled={disabled || !!capture.transcribed} accessibilityLabel={capture.transcribed ? 'Transcription added' : 'Transcribe recording'} accessibilityHint="Uploads this saved recording securely to Lumora. It will not send a chat message." testID="transcribe-recording-button" style={[styles.transcribeBtn, capture.transcribed && styles.transcribedBtn]}>
+            <Ionicons name={capture.transcribed ? 'checkmark' : 'text-outline'} size={19} color={C.white} />
+          </PressableScale>
+        ) : capture.phase === 'transcribing' ? (
+          <View accessibilityRole="progressbar" accessibilityLabel="Transcribing audio" accessibilityState={{ busy: true }} testID="transcribing-indicator" style={styles.transcribingBtn}>
+            <ActivityIndicator size="small" color={C.blueBright} />
+          </View>
         ) : (
           <PressableScale onPress={onSend} disabled={!canSend} accessibilityLabel="Send message">
-            <LinearGradient
-              testID="send-touch-target"
-              colors={canSend ? ['#6758D9', '#5142B8'] : ['#262832', '#262832']}
-              start={{ x: 0, y: 0 }}
-              end={{ x: 1, y: 1 }}
-              style={styles.sendBtn}
-            >
+            <LinearGradient testID="send-touch-target" colors={canSend ? ['#6758D9', '#5142B8'] : ['#262832', '#262832']} start={{ x: 0, y: 0 }} end={{ x: 1, y: 1 }} style={styles.sendBtn}>
               <Ionicons name="arrow-up" size={19} color={canSend ? C.white : C.muted} />
             </LinearGradient>
           </PressableScale>
@@ -1926,6 +2240,7 @@ const Composer = memo(/** @param {any} props */ function Composer({ value, onCha
         </Text>
         {near && <Text style={styles.counter}>{`${value.length}/${LIMITS.maxInput}`}</Text>}
       </View>
+      {!!voiceStatus && <Text accessibilityLiveRegion="polite" style={styles.voiceStatus}>{voiceStatus}</Text>}
     </View>
   );
 });
@@ -2985,6 +3300,8 @@ function LumoraApp() {
         <Composer
           value={input}
           onChangeText={setInput}
+          apiBaseUrl={apiBaseUrl}
+          onRecordingError={(message) => showToast(message, 'mic-off-outline')}
           onSend={onSendPress}
           onStop={stopGeneration}
           isGenerating={isGenerating}
@@ -3350,8 +3667,15 @@ const styles = StyleSheet.create({
   sendBtn: { width: 48, height: 48, borderRadius: RADIUS.lg, alignItems: 'center', justifyContent: 'center' },
   stopBtn: { width: 48, height: 48, borderRadius: RADIUS.lg, alignItems: 'center', justifyContent: 'center', backgroundColor: C.amberSoft, borderWidth: 1, borderColor: 'rgba(215,173,114,0.38)' },
   stopSquare: { width: 12, height: 12, borderRadius: 3, backgroundColor: C.amber },
+  recordingStartBtn: { width: 42, height: 42, borderRadius: RADIUS.lg, alignItems: 'center', justifyContent: 'center', backgroundColor: C.surface2, borderWidth: 1, borderColor: C.border },
+  recordingCancelBtn: { width: 40, height: 42, borderRadius: RADIUS.lg, alignItems: 'center', justifyContent: 'center', backgroundColor: C.redSoft, borderWidth: 1, borderColor: 'rgba(239,100,100,0.35)' },
+  recordingStopBtn: { width: 48, height: 48, borderRadius: RADIUS.lg, alignItems: 'center', justifyContent: 'center', backgroundColor: C.red, borderWidth: 1, borderColor: 'rgba(239,100,100,0.5)' },
+  transcribeBtn: { width: 48, height: 48, borderRadius: RADIUS.lg, alignItems: 'center', justifyContent: 'center', backgroundColor: C.blueDeep, borderWidth: 1, borderColor: 'rgba(177,164,255,0.45)' },
+  transcribedBtn: { backgroundColor: C.greenSoft },
+  transcribingBtn: { width: 48, height: 48, borderRadius: RADIUS.lg, alignItems: 'center', justifyContent: 'center', backgroundColor: C.surface2 },
   composerMeta: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingHorizontal: SPACE.xs, paddingTop: 6 },
   composerHint: { color: C.muted, fontSize: 12 },
+  voiceStatus: { color: C.slate, fontSize: 12, paddingHorizontal: SPACE.xs, paddingTop: 4 },
   counter: { color: C.amber, fontSize: 12, fontWeight: '700' },
   jumpWrap: { position: 'absolute', bottom: 12, alignSelf: 'center' },
   jumpBtn: {

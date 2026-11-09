@@ -29,6 +29,15 @@
       "expo-status-bar",
       "expo-font",
       [
+        "expo-audio",
+        {
+          "microphonePermission": "Allow Lumora AI to use your microphone while you record a voice message.",
+          "recordAudioAndroid": true,
+          "enableBackgroundRecording": false,
+          "enableBackgroundPlayback": false
+        }
+      ],
+      [
         "expo-splash-screen",
         {
           "image": "./assets/splash-icon.png",

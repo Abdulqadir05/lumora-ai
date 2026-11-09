@@ -17,6 +17,7 @@
  *   POST /api/tools/weather
  *   POST /api/tools/crypto
  *   POST /api/tools/currency
+ *   POST /api/voice/transcribe
  *
  * Run:  cp .env.example .env  →  fill LLM_API_KEY  →  npm install  →  npm start
  */
@@ -27,6 +28,7 @@ import { isIP } from 'node:net';
 import express from 'express';
 import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
+import multer from 'multer';
 
 // ─── Configuration ──────────────────────────────────────────────────────────
 const NODE_ENV = process.env.NODE_ENV || '';
@@ -305,7 +307,7 @@ function rateLimitDiagnosticMetadata(headers) {
   };
 }
 
-async function fetchData(url, { signal, timeout = LIMITS.toolTimeoutMs, as = 'json', diagnosticStage, ...init } = {}) {
+async function fetchData(url, { signal, timeout = LIMITS.toolTimeoutMs, as = 'json', diagnosticStage, mapHttpError, ...init } = {}) {
   const link = linkedController(signal, timeout);
   let upstreamStatus;
   let rateLimitMetadata = {};
@@ -337,9 +339,10 @@ async function fetchData(url, { signal, timeout = LIMITS.toolTimeoutMs, as = 'js
     upstreamStatus = res.status;
     if (res.status === 429) {
       rateLimitMetadata = rateLimitDiagnosticMetadata(res.headers);
+      if (typeof mapHttpError === 'function') throw mapHttpError(res.status);
       throw new HttpError(503, 'tool_rate_limited', 'Provider rate limit reached — try again in a minute');
     }
-    if (!res.ok) throw new HttpError(502, 'tool_http', `Provider responded with HTTP ${res.status}`);
+    if (!res.ok) throw typeof mapHttpError === 'function' ? mapHttpError(res.status) : new HttpError(502, 'tool_http', `Provider responded with HTTP ${res.status}`);
     if (as === 'text') return await res.text();
     try {
       return await res.json();
@@ -1765,6 +1768,17 @@ app.use('/api', (req, res, next) => {
 app.use(express.json({ limit: '256kb' }));
 const chatLimiter = limiter(Number(process.env.CHAT_RATE_PER_MIN) || 20);
 const toolLimiter = limiter(Number(process.env.TOOL_RATE_PER_MIN) || 60);
+const boundedVoiceSetting = (name, fallback, min, max) => {
+  const raw = process.env[name]?.trim();
+  if (!raw || !/^\d+$/.test(raw)) return fallback;
+  const parsed = Number(raw);
+  return Number.isSafeInteger(parsed) ? Math.min(max, Math.max(min, parsed)) : fallback;
+};
+const voiceLimiter = limiter(boundedVoiceSetting('VOICE_RATE_PER_MIN', 5, 1, 120));
+const VOICE_MAX_CONCURRENT = boundedVoiceSetting('VOICE_MAX_CONCURRENT', 2, 1, 4);
+const VOICE_TRANSCRIPTION_TIMEOUT_MS = boundedVoiceSetting('VOICE_TRANSCRIBE_TIMEOUT_MS', 60_000, 100, 120_000);
+const VOICE_MAX_FILE_BYTES = 10 * 1024 * 1024;
+let activeVoiceTranscriptions = 0;
 const boundedTtsSetting = (name, fallback, min, max) => {
   const raw = process.env[name]?.trim();
   if (!raw || !/^\d+$/.test(raw)) return fallback;
@@ -1796,6 +1810,92 @@ const SAFE_GEMINI_TTS_ERROR_STATUSES = new Set([
   'UNKNOWN',
 ]);
 let activeGeminiTtsRequests = 0;
+
+const voiceUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: VOICE_MAX_FILE_BYTES, files: 1, fields: 0, parts: 1, fieldNameSize: 16 },
+  fileFilter(_req, file, callback) {
+    const suppliedName = typeof file.originalname === 'string' ? file.originalname : '';
+    const baseName = suppliedName.split(/[\\/]/).at(-1) || '';
+    if (file.mimetype?.toLowerCase() !== 'audio/mp4' || !baseName || baseName.length > 128 || !/\.m4a$/i.test(baseName)) {
+      return callback(new HttpError(415, 'unsupported_audio', 'Upload one M4A audio file using audio/mp4.'));
+    }
+    callback(null, true);
+  },
+});
+
+function reserveVoiceSlot(_req, res, next) {
+  if (activeVoiceTranscriptions >= VOICE_MAX_CONCURRENT) {
+    return sendError(res, new HttpError(503, 'voice_busy', 'Speech transcription is busy. Please try again shortly.'));
+  }
+  activeVoiceTranscriptions += 1;
+  let released = false;
+  const release = () => {
+    if (released) return;
+    released = true;
+    activeVoiceTranscriptions = Math.max(0, activeVoiceTranscriptions - 1);
+  };
+  res.once('finish', release);
+  res.once('close', release);
+  next();
+}
+
+function attachVoiceCancellation(req, res, next) {
+  const controller = new AbortController();
+  req.voiceSignal = controller.signal;
+  req.once('aborted', () => controller.abort());
+  res.once('close', () => {
+    if (!res.writableEnded) controller.abort();
+  });
+  next();
+}
+
+function requireMultipart(req, res, next) {
+  if (!req.is('multipart/form-data')) return sendError(res, new HttpError(400, 'invalid_multipart', 'Send one audio file as multipart/form-data.'));
+  next();
+}
+
+function validM4aSignature(buffer) {
+  if (!Buffer.isBuffer(buffer) || buffer.length < 12) return false;
+  const boxSize = buffer.readUInt32BE(0);
+  return buffer.toString('ascii', 4, 8) === 'ftyp' && boxSize >= 12 && boxSize <= buffer.length;
+}
+
+function transcriptionProviderError(status) {
+  if (status === 401) return new HttpError(502, 'provider_auth', 'The transcription provider rejected the server credentials.');
+  if (status === 403) return new HttpError(502, 'provider_access_denied', 'The transcription provider denied access to speech transcription.');
+  if (status === 429) return new HttpError(503, 'provider_rate_limited', 'Speech transcription is temporarily rate limited. Try again shortly.', { retryable: true });
+  if (status >= 500) return new HttpError(502, 'provider_unavailable', 'Speech transcription is temporarily unavailable. Please try again shortly.', { retryable: true });
+  return new HttpError(502, 'provider_rejected', 'The transcription provider could not process this audio.');
+}
+
+async function handleTranscription(req, res) {
+  try {
+    const file = req.file;
+    if (!file?.buffer?.length) throw new HttpError(400, 'audio_required', 'Attach one non-empty audio file in the audio field.');
+    if (!validM4aSignature(file.buffer)) throw new HttpError(400, 'invalid_audio', 'The uploaded file is not a valid M4A audio container.');
+    if (!LLM.apiKey) throw new HttpError(503, 'provider_not_configured', 'Speech transcription is not configured on the server.');
+
+    const form = new FormData();
+    form.append('model', 'whisper-large-v3-turbo');
+    form.append('response_format', 'json');
+    form.append('file', new Blob([file.buffer], { type: 'audio/mp4' }), 'recording.m4a');
+    const result = await fetchData(`${LLM.baseUrl}/audio/transcriptions`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${LLM.apiKey}` },
+      body: form,
+      signal: req.voiceSignal,
+      timeout: VOICE_TRANSCRIPTION_TIMEOUT_MS,
+      mapHttpError: transcriptionProviderError,
+    });
+    if (!result || typeof result.text !== 'string') {
+      throw new HttpError(502, 'provider_malformed', 'The transcription provider returned an invalid response.');
+    }
+    res.json({ text: result.text.trim() });
+  } catch (error) {
+    if (!res.destroyed && !res.writableEnded) sendError(res, error);
+  }
+}
 
 function reserveGeminiTtsSlot(_req, res, next) {
   if (activeGeminiTtsRequests >= GEMINI_TTS_MAX_CONCURRENT) {
@@ -2289,11 +2389,28 @@ app.post('/api/tools/news', toolLimiter, toolRoute((b, s) => getNews(b.query, s)
 app.post('/api/tools/weather', toolLimiter, toolRoute((b, s) => getWeather(b.location, s)));
 app.post('/api/tools/crypto', toolLimiter, toolRoute((b, s) => getCrypto(Array.isArray(b.assets) ? b.assets : [], s)));
 app.post('/api/tools/currency', toolLimiter, toolRoute((b, s) => getCurrency({ from: b.from, to: b.to, amount: b.amount ?? 1 }, s)));
+app.post(
+  '/api/voice/transcribe',
+  voiceLimiter,
+  reserveVoiceSlot,
+  attachVoiceCancellation,
+  requireMultipart,
+  (req, res, next) => voiceUpload.single('audio')(req, res, next),
+  handleTranscription,
+);
 app.post('/api/tts', geminiTtsLimiter, reserveGeminiTtsSlot, attachGeminiTtsCancellation, handleGeminiTts);
 
 app.use((req, res) => sendError(res, new HttpError(404, 'not_found', 'Endpoint not found.')));
 // eslint-disable-next-line no-unused-vars
 app.use((err, req, res, next) => {
+  const isVoiceRoute = req.method === 'POST' && req.path === '/api/voice/transcribe';
+  if (isVoiceRoute && (res.destroyed || res.writableEnded)) return;
+  if (isVoiceRoute && err instanceof multer.MulterError) {
+    if (err.code === 'LIMIT_FILE_SIZE') return sendError(res, new HttpError(413, 'payload_too_large', 'Audio upload exceeds the 10 MiB limit.'));
+    return sendError(res, new HttpError(400, 'invalid_multipart', 'Audio upload is malformed or contains unexpected fields.'));
+  }
+  if (isVoiceRoute && err instanceof HttpError) return sendError(res, err);
+  if (isVoiceRoute && err) return sendError(res, new HttpError(400, 'invalid_multipart', 'Audio upload is malformed.'));
   if (err?.type === 'entity.parse.failed') return sendError(res, new HttpError(400, 'invalid_json', 'Request body is not valid JSON.'));
   if (err?.type === 'entity.too.large') return sendError(res, new HttpError(413, 'payload_too_large', 'Request body is too large.'));
   sendError(res, err);

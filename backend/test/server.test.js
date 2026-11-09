@@ -81,7 +81,7 @@ function mockCompletion(body, last) {
 }
 
 // ─── Mock provider ──────────────────────────────────────────────────────────
-const provider = { calls: [], ttsCalls: [], aborted: 0, abortedTts: 0, port: 0, fxCalls: 0 };
+const provider = { calls: [], transcriptions: [], ttsCalls: [], aborted: 0, abortedTranscriptions: 0, abortedTts: 0, port: 0, fxCalls: 0 };
 const mock = http.createServer((req, res) => {
   if (req.url === '/__test__/fx-hit' && req.method === 'POST') {
     provider.fxCalls += 1;
@@ -91,6 +91,44 @@ const mock = http.createServer((req, res) => {
   if (req.url.endsWith('/models')) {
     res.setHeader('content-type', 'application/json');
     res.end(JSON.stringify({ data: [{ id: 'openai/gpt-oss-20b' }, { id: 'qwen/qwen3.8-27b' }] }));
+    return;
+  }
+  if (req.url === '/v1/audio/transcriptions' && req.method === 'POST') {
+    const chunks = [];
+    req.on('data', (chunk) => chunks.push(chunk));
+    req.on('end', () => {
+      const raw = Buffer.concat(chunks);
+      const bodyText = raw.toString('latin1');
+      provider.transcriptions.push({
+        model: bodyText.match(/name="model"\r\n\r\n([^\r\n]+)/)?.[1],
+        responseFormat: bodyText.match(/name="response_format"\r\n\r\n([^\r\n]+)/)?.[1],
+        fileField: bodyText.match(/Content-Disposition: form-data; name="([^"]+)"; filename=/)?.[1],
+        fileName: bodyText.match(/name="file"; filename="([^"]+)"/)?.[1],
+        fileMime: bodyText.match(/name="file"; filename="[^\"]+"\r\nContent-Type: ([^\r\n]+)/)?.[1],
+        hasAudioSentinel: raw.includes(Buffer.from('AUDIO_SENTINEL')),
+        authorizationPresent: /^Bearer \S+$/i.test(req.headers.authorization || ''),
+        multipartBoundaryPresent: /^multipart\/form-data;\s*boundary=.+/i.test(req.headers['content-type'] || ''),
+      });
+      if (raw.includes(Buffer.from('TRANSCRIBE_401'))) return res.writeHead(401).end('{"error":{"message":"PROVIDER_PRIVATE_SENTINEL"}}');
+      if (raw.includes(Buffer.from('TRANSCRIBE_429'))) return res.writeHead(429).end('{"error":{"message":"PROVIDER_PRIVATE_SENTINEL"}}');
+      if (raw.includes(Buffer.from('TRANSCRIBE_500'))) return res.writeHead(500).end('{"error":{"message":"PROVIDER_PRIVATE_SENTINEL"}}');
+      if (raw.includes(Buffer.from('TRANSCRIBE_TIMEOUT')) || raw.includes(Buffer.from('TRANSCRIBE_HOLD'))) {
+        const delay = raw.includes(Buffer.from('TRANSCRIBE_HOLD')) ? 180 : 500;
+        let finished = false;
+        const timer = setTimeout(() => {
+          if (!res.destroyed) {
+            finished = true;
+            res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ text: 'Delayed transcription.' }));
+          }
+        }, delay);
+        res.on('close', () => {
+          clearTimeout(timer);
+          if (!finished) provider.abortedTranscriptions += 1;
+        });
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ text: 'Recognized words.' }));
+    });
     return;
   }
   if (req.url === '/v1beta/interactions' && req.method === 'POST') {
@@ -221,9 +259,15 @@ const mock = http.createServer((req, res) => {
 });
 
 const children = [];
-function startServer(env) {
+async function startServer(env) {
+  const portProbe = http.createServer();
+  await new Promise((resolve, reject) => {
+    portProbe.once('error', reject);
+    portProbe.listen(0, '127.0.0.1', resolve);
+  });
+  const port = portProbe.address().port;
+  await new Promise((resolve) => portProbe.close(resolve));
   return new Promise((resolve, reject) => {
-    const port = 20000 + Math.floor(Math.random() * 20000);
     const child = spawn(process.execPath, ['--require', WEATHER_MOCK, SERVER], {
       env: { PATH: process.env.PATH, PORT: String(port), NODE_ENV: 'test', DOTENV_CONFIG_PATH: '/dev/null', TRUST_PROXY: '', LLM_BASE_URL: `http://127.0.0.1:${provider.port}/v1`, LLM_API_KEY: 'sk-secret-test-value', TAVILY_API_KEY: '', LUMORA_TEST_GEMINI_TTS_URL: `http://127.0.0.1:${provider.port}/v1beta/interactions`, LUMORA_TEST_FX_OBSERVER_URL: `http://127.0.0.1:${provider.port}/__test__/fx-hit`, ...env },
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -245,6 +289,29 @@ const auth = { Authorization: `Bearer ${TOKEN}`, 'Content-Type': 'application/js
 const ttsBody = (text) => JSON.stringify({ text });
 const chatBody = (content, extra = {}) => JSON.stringify({ model: 'gpt-oss-20b', messages: [{ role: 'user', content }], ...extra });
 const chatConversationBody = (messages, extra = {}) => JSON.stringify({ model: 'gpt-oss-20b', messages, ...extra });
+
+function m4aBytes(marker = 'AUDIO_SENTINEL') {
+  const header = Buffer.alloc(20);
+  header.writeUInt32BE(20, 0);
+  header.write('ftyp', 4, 'ascii');
+  header.write('M4A ', 8, 'ascii');
+  header.writeUInt32BE(0, 12);
+  header.write('M4A ', 16, 'ascii');
+  return Buffer.concat([header, Buffer.from(marker)]);
+}
+
+function multipartAudio({ field = 'audio', filename = 'voice.m4a', mime = 'audio/mp4', bytes = m4aBytes(), malformed = false } = {}) {
+  const boundary = `LumoraAudioBoundary${Math.random().toString(16).slice(2)}`;
+  const ending = malformed ? '' : `\r\n--${boundary}--\r\n`;
+  return {
+    headers: { Authorization: `Bearer ${TOKEN}`, 'Content-Type': `multipart/form-data; boundary=${boundary}` },
+    body: Buffer.concat([
+      Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="${field}"; filename="${filename}"\r\nContent-Type: ${mime}\r\n\r\n`),
+      bytes,
+      Buffer.from(ending),
+    ]),
+  };
+}
 
 function parseSSE(text) {
   return text
@@ -290,6 +357,8 @@ before(async () => {
     CORS_ORIGINS: 'https://admin.example.com',
     API_RATE_PER_MIN: '1000',
     CHAT_RATE_PER_MIN: '1000',
+    VOICE_RATE_PER_MIN: '1000',
+    VOICE_MAX_CONCURRENT: '4',
     DEFAULT_WEATHER_CITY: 'search on Google',
   })).url;
 });
@@ -329,6 +398,7 @@ test('protected chat and tool routes reject missing, invalid, and malformed bear
     { method: 'POST', url: `${api}/api/tools/weather`, body: '{}' },
     { method: 'POST', url: `${api}/api/tools/crypto`, body: '{}' },
     { method: 'POST', url: `${api}/api/tools/currency`, body: '{}' },
+    { method: 'POST', url: `${api}/api/voice/transcribe`, body: '{}' },
     { method: 'POST', url: `${api}/api/tts`, body: '{}' },
   ];
   const malformed = ['Basic token', 'Bearer', 'Bearer  ' + TOKEN, `Bearer ${TOKEN} extra`];
@@ -355,6 +425,138 @@ test('protected chat and tool routes reject missing, invalid, and malformed bear
   const tool = await fetch(`${api}/api/tools/search`, { method: 'POST', headers: auth, body: JSON.stringify({ query: 'test' }) });
   assert.equal(tool.status, 503); // authenticated; Tavily is intentionally unset in this test server
   assert.equal((await tool.json()).error.code, 'search_not_configured');
+});
+
+test('Whisper accepts one M4A, forwards it to the fixed model, and returns only transcription text', async () => {
+  const before = provider.transcriptions.length;
+  const upload = multipartAudio();
+  const response = await fetch(`${api}/api/voice/transcribe`, { method: 'POST', headers: upload.headers, body: upload.body });
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), { text: 'Recognized words.' });
+  assert.equal(provider.transcriptions.length, before + 1);
+  assert.deepEqual(provider.transcriptions.at(-1), {
+    model: 'whisper-large-v3-turbo',
+    responseFormat: 'json',
+    fileField: 'file',
+    fileName: 'recording.m4a',
+    fileMime: 'audio/mp4',
+    hasAudioSentinel: true,
+    authorizationPresent: true,
+    multipartBoundaryPresent: true,
+  });
+});
+
+test('Whisper rejects missing and invalid authentication before parsing multipart bodies', async () => {
+  const before = provider.transcriptions.length;
+  const upload = multipartAudio({ malformed: true });
+  for (const authorization of [undefined, 'Bearer invalid']) {
+    const headers = { 'Content-Type': upload.headers['Content-Type'] };
+    if (authorization) headers.Authorization = authorization;
+    const response = await fetch(`${api}/api/voice/transcribe`, { method: 'POST', headers, body: upload.body });
+    assert.equal(response.status, 401);
+    assert.equal((await response.json()).error.code, 'unauthorized');
+  }
+  assert.equal(provider.transcriptions.length, before);
+});
+
+test('Whisper rejects empty, unsupported, invalid-signature, extra-field, and malformed uploads', async () => {
+  const before = provider.transcriptions.length;
+  const invalidUploads = [
+    { upload: multipartAudio({ bytes: Buffer.alloc(0) }), status: 400, code: 'audio_required' },
+    { upload: multipartAudio({ mime: 'audio/wav' }), status: 415, code: 'unsupported_audio' },
+    { upload: multipartAudio({ filename: 'voice.wav' }), status: 415, code: 'unsupported_audio' },
+    { upload: multipartAudio({ bytes: Buffer.from('not an m4a container') }), status: 400, code: 'invalid_audio' },
+    { upload: multipartAudio({ field: 'file' }), status: 400, code: 'invalid_multipart' },
+    { upload: multipartAudio({ malformed: true }), status: 400, code: 'invalid_multipart' },
+  ];
+  for (const { upload, status, code } of invalidUploads) {
+    const response = await fetch(`${api}/api/voice/transcribe`, { method: 'POST', headers: upload.headers, body: upload.body });
+    assert.equal(response.status, status);
+    assert.equal((await response.json()).error.code, code);
+  }
+  assert.equal(provider.transcriptions.length, before);
+});
+
+test('Whisper rejects uploads above 10 MiB before contacting the provider', async () => {
+  const before = provider.transcriptions.length;
+  const upload = multipartAudio({ bytes: Buffer.concat([m4aBytes(''), Buffer.alloc(10 * 1024 * 1024 + 1)]) });
+  const response = await fetch(`${api}/api/voice/transcribe`, { method: 'POST', headers: upload.headers, body: upload.body });
+  assert.equal(response.status, 413);
+  assert.equal((await response.json()).error.code, 'payload_too_large');
+  assert.equal(provider.transcriptions.length, before);
+});
+
+test('Whisper maps provider errors without exposing provider response details', async () => {
+  const { url, child } = await startServer({ LUMORA_CLIENT_TOKENS: TOKEN, VOICE_RATE_PER_MIN: '1000' });
+  const cases = [
+    { marker: 'TRANSCRIBE_401', status: 502, code: 'provider_auth' },
+    { marker: 'TRANSCRIBE_429', status: 503, code: 'provider_rate_limited' },
+    { marker: 'TRANSCRIBE_500', status: 502, code: 'provider_unavailable' },
+  ];
+  for (const { marker, status, code } of cases) {
+    const upload = multipartAudio({ bytes: m4aBytes(marker) });
+    const response = await fetch(`${url}/api/voice/transcribe`, { method: 'POST', headers: upload.headers, body: upload.body });
+    const body = await response.text();
+    assert.equal(response.status, status);
+    assert.equal(JSON.parse(body).error.code, code);
+    assert.doesNotMatch(body, /PROVIDER_PRIVATE_SENTINEL|authorization|api.?key/i);
+  }
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.doesNotMatch(child.getOutput(), /PROVIDER_PRIVATE_SENTINEL|TRANSCRIBE_|AUDIO_SENTINEL|sk-secret-test-value|Bearer/i);
+});
+
+test('Whisper maps provider timeouts to a sanitized response', async () => {
+  const { url } = await startServer({ LUMORA_CLIENT_TOKENS: TOKEN, VOICE_TRANSCRIBE_TIMEOUT_MS: '100', VOICE_RATE_PER_MIN: '1000' });
+  const upload = multipartAudio({ bytes: m4aBytes('TRANSCRIBE_TIMEOUT') });
+  const response = await fetch(`${url}/api/voice/transcribe`, { method: 'POST', headers: upload.headers, body: upload.body });
+  assert.equal(response.status, 504);
+  assert.equal((await response.json()).error.code, 'tool_timeout');
+});
+
+test('Whisper client disconnect aborts the upstream provider request', async () => {
+  const beforeCalls = provider.transcriptions.length;
+  const beforeAborts = provider.abortedTranscriptions;
+  const upload = multipartAudio({ bytes: m4aBytes('TRANSCRIBE_TIMEOUT') });
+  const controller = new AbortController();
+  const request = fetch(`${api}/api/voice/transcribe`, { method: 'POST', headers: upload.headers, body: upload.body, signal: controller.signal });
+  await waitForCondition(() => provider.transcriptions.length > beforeCalls);
+  controller.abort();
+  await assert.rejects(request);
+  await waitForCondition(() => provider.abortedTranscriptions > beforeAborts);
+});
+
+test('Whisper refuses to call Groq when the backend provider credential is not configured', async () => {
+  const before = provider.transcriptions.length;
+  const { url } = await startServer({ LUMORA_CLIENT_TOKENS: TOKEN, LLM_API_KEY: '', GROQ_API_KEY: '' });
+  const upload = multipartAudio();
+  const response = await fetch(`${url}/api/voice/transcribe`, { method: 'POST', headers: upload.headers, body: upload.body });
+  assert.equal(response.status, 503);
+  assert.equal((await response.json()).error.code, 'provider_not_configured');
+  assert.equal(provider.transcriptions.length, before);
+});
+
+test('Whisper bounds concurrent requests and has a route-specific rate limit', async () => {
+  const bounded = await startServer({ LUMORA_CLIENT_TOKENS: TOKEN, VOICE_MAX_CONCURRENT: '1', VOICE_RATE_PER_MIN: '1000' });
+  const beforeConcurrent = provider.transcriptions.length;
+  const firstUpload = multipartAudio({ bytes: m4aBytes('TRANSCRIBE_HOLD') });
+  const firstRequest = fetch(`${bounded.url}/api/voice/transcribe`, { method: 'POST', headers: firstUpload.headers, body: firstUpload.body });
+  await waitForCondition(() => provider.transcriptions.length > beforeConcurrent);
+  const secondUpload = multipartAudio();
+  const secondResponse = await fetch(`${bounded.url}/api/voice/transcribe`, { method: 'POST', headers: secondUpload.headers, body: secondUpload.body });
+  assert.equal(secondResponse.status, 503);
+  assert.equal((await secondResponse.json()).error.code, 'voice_busy');
+  assert.equal((await firstRequest).status, 200);
+
+  const limited = await startServer({ LUMORA_CLIENT_TOKENS: TOKEN, VOICE_RATE_PER_MIN: '1', API_RATE_PER_MIN: '1000' });
+  const beforeRate = provider.transcriptions.length;
+  const firstRateUpload = multipartAudio();
+  const first = await fetch(`${limited.url}/api/voice/transcribe`, { method: 'POST', headers: firstRateUpload.headers, body: firstRateUpload.body });
+  assert.equal(first.status, 200);
+  const secondRateUpload = multipartAudio();
+  const second = await fetch(`${limited.url}/api/voice/transcribe`, { method: 'POST', headers: secondRateUpload.headers, body: secondRateUpload.body });
+  assert.equal(second.status, 429);
+  assert.equal((await second.json()).error.code, 'rate_limited');
+  assert.equal(provider.transcriptions.length, beforeRate + 1);
 });
 
 test('Gemini TTS uses the configured model and voice and returns WAV bytes without leaking credentials', async () => {

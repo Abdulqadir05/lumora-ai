@@ -9,7 +9,91 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as Clipboard from 'expo-clipboard';
 import { fetch as expoFetch } from 'expo/fetch';
 import { TextEncoder } from 'util';
-import App from '../App';
+
+jest.mock('expo-audio', () => {
+  const mockRecorder = {
+    uri: 'file:///cache/voice-recording.m4a',
+    prepareToRecordAsync: jest.fn(async () => {}),
+    record: jest.fn(async () => {}),
+    stop: jest.fn(async () => {}),
+  };
+  const mockSetAudioModeAsync = jest.fn(async () => {});
+  const mockRequestRecordingPermissionsAsync = jest.fn(async () => ({ granted: true }));
+  return {
+    AudioModule: { requestRecordingPermissionsAsync: mockRequestRecordingPermissionsAsync },
+    RecordingPresets: { HIGH_QUALITY: { extension: '.m4a' } },
+    setAudioModeAsync: mockSetAudioModeAsync,
+    useAudioRecorder: jest.fn(() => mockRecorder),
+    useAudioRecorderState: jest.fn(() => ({ durationMillis: 1500, isRecording: false })),
+    __mockRecorder: mockRecorder,
+    __mockSetAudioModeAsync: mockSetAudioModeAsync,
+    __mockRequestRecordingPermissionsAsync: mockRequestRecordingPermissionsAsync,
+  };
+});
+
+jest.mock('expo-file-system', () => {
+  let uploadResponse = { status: 200, body: JSON.stringify({ text: 'Transcribed speech.' }) };
+  let holdUpload = false;
+  const mockCopyFile = jest.fn();
+  const mockDeleteFile = jest.fn();
+  const mockCreateUploadTask = jest.fn();
+  const mockDeleteDirectory = jest.fn();
+  const Paths = { cache: { uri: 'file:///cache' } };
+  class MockDirectory {
+    constructor(base, name) {
+      this.uri = `${base.uri}/${name}`;
+      this.exists = true;
+    }
+    create() {}
+    delete() { mockDeleteDirectory(this.uri); this.exists = false; }
+  }
+  class MockFile {
+    constructor(parent, name) {
+      this.uri = typeof parent === 'string' ? parent : `${parent.uri}/${name}`;
+      this.name = name || this.uri.split('/').pop();
+      this.exists = true;
+    }
+    async copy(destination) { mockCopyFile(this.uri, destination.uri); }
+    delete() { mockDeleteFile(this.uri); this.exists = false; }
+    createUploadTask(url, options) {
+      mockCreateUploadTask(url, options);
+      return {
+        uploadAsync: jest.fn(() => new Promise((resolve, reject) => {
+          options.onProgress?.({ bytesSent: 50, totalBytes: 100 });
+          if (!holdUpload) return resolve(uploadResponse);
+          const aborted = () => {
+            const error = new Error('aborted');
+            error.name = 'AbortError';
+            reject(error);
+          };
+          if (options.signal?.aborted) return aborted();
+          options.signal?.addEventListener('abort', aborted, { once: true });
+        })),
+        cancelAsync: jest.fn(async () => {}),
+        release: jest.fn(),
+      };
+    }
+  }
+  return {
+    Directory: MockDirectory,
+    File: MockFile,
+    Paths,
+    UploadType: { MULTIPART: 'multipart' },
+    __mockCopyFile: mockCopyFile,
+    __mockDeleteFile: mockDeleteFile,
+    __mockCreateUploadTask: mockCreateUploadTask,
+    __mockDeleteDirectory: mockDeleteDirectory,
+    __setUploadResponse: (response) => { uploadResponse = response; },
+    __setHoldUpload: (value) => { holdUpload = value; },
+  };
+});
+
+let App;
+beforeAll(() => {
+  process.env.EXPO_PUBLIC_LUMORA_API_URL = 'http://localhost:8787';
+  process.env.EXPO_PUBLIC_LUMORA_CLIENT_TOKEN = 'local-test-client-token-not-a-secret';
+  App = require('../App').default;
+});
 
 const encoder = new TextEncoder();
 
@@ -124,6 +208,12 @@ beforeEach(async () => {
   modelsPayload = MODELS_ALL;
   await AsyncStorage.clear();
   jest.clearAllMocks();
+  const audio = jest.requireMock('expo-audio');
+  audio.__mockRequestRecordingPermissionsAsync.mockResolvedValue({ granted: true });
+  audio.__mockRecorder.uri = 'file:///cache/voice-recording.m4a';
+  const fileSystem = jest.requireMock('expo-file-system');
+  fileSystem.__setUploadResponse({ status: 200, body: JSON.stringify({ text: 'Transcribed speech.' }) });
+  fileSystem.__setHoldUpload(false);
   mockBackend();
 });
 
@@ -763,5 +853,91 @@ describe('scrolling', () => {
     await waitFor(() => expect(wrapperPointer()).toBe('auto'));
     await fireEvent.scroll(list, ev(1390));
     await waitFor(() => expect(wrapperPointer()).toBe('none'));
+  });
+});
+
+describe('voice transcription', () => {
+  it('requests microphone permission on tap, uploads multipart M4A with auth, and fills the editable draft without sending it', async () => {
+    await renderReady();
+    const audio = jest.requireMock('expo-audio');
+    const fileSystem = jest.requireMock('expo-file-system');
+    expect(audio.__mockRequestRecordingPermissionsAsync).not.toHaveBeenCalled();
+
+    await fireEvent.changeText(screen.getByLabelText('Message input'), 'Keep this draft');
+    await fireEvent.press(screen.getByLabelText('Start recording'));
+    expect(audio.__mockRequestRecordingPermissionsAsync).toHaveBeenCalledTimes(1);
+    await screen.findByLabelText('Stop recording');
+    await fireEvent.press(screen.getByLabelText('Stop recording'));
+    await screen.findByLabelText('Transcribe recording');
+    expect(audio.__mockSetAudioModeAsync).toHaveBeenLastCalledWith({ allowsRecording: false, playsInSilentMode: false, interruptionMode: 'mixWithOthers' });
+    expect(screen.getByText(/ready to transcribe/)).toBeTruthy();
+
+    await fireEvent.press(screen.getByLabelText('Transcribe recording'));
+    await waitFor(() => expect(screen.getByLabelText('Message input').props.value).toBe('Keep this draft\n\nTranscribed speech.'));
+    const [url, options] = fileSystem.__mockCreateUploadTask.mock.calls[0];
+    expect(url).toBe('http://localhost:8787/api/voice/transcribe');
+    expect(options.httpMethod).toBe('POST');
+    expect(options.uploadType).toBe('multipart');
+    expect(options.fieldName).toBe('audio');
+    expect(options.mimeType).toBe('audio/mp4');
+    expect(options.headers.Authorization).toBe('Bearer local-test-client-token-not-a-secret');
+    expect(options.headers['Content-Type']).toBeUndefined();
+    expect(fileSystem.__mockCopyFile).toHaveBeenCalledWith('file:///cache/voice-recording.m4a', expect.stringMatching(/\/recording\.m4a$/));
+    expect(fileSystem.__mockDeleteFile).toHaveBeenCalledWith('file:///cache/voice-recording.m4a');
+    expect(streams).toHaveLength(0);
+  });
+
+  it('keeps a failed recording for retry and leaves the current draft editable', async () => {
+    await renderReady();
+    const fileSystem = jest.requireMock('expo-file-system');
+    await fireEvent.changeText(screen.getByLabelText('Message input'), 'Original draft');
+    await fireEvent.press(screen.getByLabelText('Start recording'));
+    await screen.findByLabelText('Stop recording');
+    await fireEvent.press(screen.getByLabelText('Stop recording'));
+    fileSystem.__setUploadResponse({ status: 429, body: JSON.stringify({ error: { code: 'provider_rate_limited', message: 'private details' } }) });
+    await fireEvent.press(screen.getByLabelText('Transcribe recording'));
+    await screen.findByText(/temporarily rate limited/);
+    expect(screen.getByLabelText('Message input').props.value).toBe('Original draft');
+    expect(screen.getByLabelText('Transcribe recording')).toBeTruthy();
+    expect(fileSystem.__mockDeleteFile).not.toHaveBeenCalledWith('file:///cache/voice-recording.m4a');
+
+    fileSystem.__setUploadResponse({ status: 200, body: JSON.stringify({ text: 'Recognized after retry.' }) });
+    await fireEvent.press(screen.getByLabelText('Transcribe recording'));
+    await waitFor(() => expect(screen.getByLabelText('Message input').props.value).toBe('Original draft\n\nRecognized after retry.'));
+  });
+
+  it('shows upload progress and cancels an in-flight upload without sending a chat request', async () => {
+    await renderReady();
+    const fileSystem = jest.requireMock('expo-file-system');
+    fileSystem.__setHoldUpload(true);
+    await fireEvent.press(screen.getByLabelText('Start recording'));
+    await screen.findByLabelText('Stop recording');
+    await fireEvent.press(screen.getByLabelText('Stop recording'));
+    await fireEvent.press(screen.getByLabelText('Transcribe recording'));
+    await screen.findByLabelText('Cancel transcription');
+    expect(screen.getByText(/Uploading audio · 50%/)).toBeTruthy();
+    const [, options] = fileSystem.__mockCreateUploadTask.mock.calls[0];
+    await fireEvent.press(screen.getByLabelText('Cancel transcription'));
+    await screen.findByLabelText('Start recording');
+    expect(options.signal.aborted).toBe(true);
+    expect(fileSystem.__mockDeleteFile).toHaveBeenCalledWith('file:///cache/voice-recording.m4a');
+    expect(streams).toHaveLength(0);
+  });
+
+  it('handles microphone permission denial and preserves cancel behavior', async () => {
+    await renderReady();
+    const audio = jest.requireMock('expo-audio');
+    const fileSystem = jest.requireMock('expo-file-system');
+    audio.__mockRequestRecordingPermissionsAsync.mockResolvedValueOnce({ granted: false });
+    await fireEvent.press(screen.getByLabelText('Start recording'));
+    await screen.findByText(/Microphone permission was denied/);
+    expect(screen.getByLabelText('Start recording')).toBeTruthy();
+
+    audio.__mockRequestRecordingPermissionsAsync.mockResolvedValueOnce({ granted: true });
+    await fireEvent.press(screen.getByLabelText('Start recording'));
+    await screen.findByLabelText('Stop recording');
+    await fireEvent.press(screen.getByLabelText('Cancel recording'));
+    await screen.findByLabelText('Start recording');
+    expect(fileSystem.__mockDeleteFile).toHaveBeenCalledWith('file:///cache/voice-recording.m4a');
   });
 });
