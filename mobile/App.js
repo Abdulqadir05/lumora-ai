@@ -64,6 +64,7 @@ import { LinearGradient } from 'expo-linear-gradient';
 import Ionicons from '@expo/vector-icons/Ionicons';
 import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
 import Markdown, { MarkdownIt } from '@ronradtke/react-native-markdown-display';
+import ImageStudioScreen from './src/features/image-studio/ImageStudioScreen';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // CONFIGURATION
@@ -1168,7 +1169,8 @@ const BACKEND_STATUS = {
   unconfigured: { color: C.muted, label: 'Setup required' },
 };
 
-const Header = memo(/** @param {any} props */ function Header({ backendState, isGenerating, onHistory, onNewChat, onSettings }) {
+const Header = memo(/** @param {any} props */ function Header({ backendState, isGenerating, onHistory, onNewChat, onSettings, onImages }) {
+  const { width } = useWindowDimensions();
   const status = BACKEND_STATUS[backendState] || BACKEND_STATUS.checking;
   return (
     <View style={styles.header}>
@@ -1187,7 +1189,8 @@ const Header = memo(/** @param {any} props */ function Header({ backendState, is
           </View>
         </View>
       </View>
-      <View style={styles.headerRight}>
+      <View testID="header-actions" style={[styles.headerRight, width < 400 && styles.headerRightCompact]}>
+        <IconButton icon="color-wand-outline" label="Image Studio" onPress={onImages} />
         <IconButton icon="time-outline" label="Conversation history" onPress={onHistory} />
         <IconButton icon="create-outline" label="New chat" onPress={onNewChat} />
         <IconButton icon="settings-outline" label="Settings" onPress={onSettings} />
@@ -2559,6 +2562,7 @@ function HistorySheet({ visible, conversations, activeId, onClose, onOpen, onDel
 function LumoraApp() {
   const insets = useSafeAreaInsets();
   const { width } = useWindowDimensions();
+  const reducedMotion = useReducedMotionPreference();
   const kb = useKeyboard();
   const mountedRef = useMountedRef();
 
@@ -2572,6 +2576,7 @@ function LumoraApp() {
   const [backend, setBackend] = useState({ state: 'checking', models: {}, provider: null, error: null });
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
+  const [imageStudioOpen, setImageStudioOpen] = useState(false);
   const [showJump, setShowJump] = useState(false);
   const [toast, setToast] = useState(null);
   const [layoutHeight, setLayoutHeight] = useState(0);
@@ -3266,6 +3271,11 @@ function LumoraApp() {
           onHistory={() => setHistoryOpen(true)}
           onNewChat={resetChat}
           onSettings={() => setSettingsOpen(true)}
+          onImages={() => {
+            setSettingsOpen(false);
+            setHistoryOpen(false);
+            setImageStudioOpen(true);
+          }}
         />
         <ModelSelector activeId={prefs.modelId} availability={backend.models} onSelect={selectModel} />
       </View>
@@ -3338,6 +3348,16 @@ function LumoraApp() {
           startNewConversation(true);
         }}
         onClearAll={clearAllHistory}
+      />
+      <ImageStudioScreen
+        visible={imageStudioOpen}
+        apiBaseUrl={apiBaseUrl}
+        buildHeaders={buildHeaders}
+        onClose={() => setImageStudioOpen(false)}
+        tokens={TOKENS}
+        reducedMotion={reducedMotion}
+        IconButtonComponent={IconButton}
+        PressableScaleComponent={PressableScale}
       />
     </View>
   );
@@ -3416,6 +3436,7 @@ const styles = StyleSheet.create({
   statusRow: { flexDirection: 'row', alignItems: 'center', marginTop: 3 },
   statusText: { color: C.slate, fontSize: TYPE.caption, marginLeft: 7, flexShrink: 1 },
   headerRight: { flexDirection: 'row', gap: SPACE.xs, marginLeft: SPACE.xs },
+  headerRightCompact: { width: 92, flexWrap: 'wrap', justifyContent: 'flex-end', gap: SPACE.xxs },
   iconBtn: {
     width: 42,
     height: 42,

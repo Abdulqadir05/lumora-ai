@@ -3,10 +3,12 @@
  * Native modules and the network are mocked; nothing here exercises a real device.
  */
 import React from 'react';
-import { AccessibilityInfo, Alert, Animated, Linking, StyleSheet } from 'react-native';
+import { AccessibilityInfo, Alert, Animated, Dimensions, Linking, StyleSheet } from 'react-native';
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as Clipboard from 'expo-clipboard';
+import * as MediaLibrary from 'expo-media-library';
+import * as Sharing from 'expo-sharing';
 import { fetch as expoFetch } from 'expo/fetch';
 import { TextEncoder } from 'util';
 
@@ -38,14 +40,18 @@ jest.mock('expo-file-system', () => {
   const mockDeleteFile = jest.fn();
   const mockCreateUploadTask = jest.fn();
   const mockDeleteDirectory = jest.fn();
+  const mockListDirectory = jest.fn(() => []);
+  const mockWriteFile = jest.fn(async () => {});
   const Paths = { cache: { uri: 'file:///cache' } };
   class MockDirectory {
     constructor(base, name) {
-      this.uri = `${base.uri}/${name}`;
+      this.uri = name ? `${base.uri}/${name}` : base.uri;
+      this.name = name || this.uri.split('/').pop();
       this.exists = true;
     }
     create() {}
     delete() { mockDeleteDirectory(this.uri); this.exists = false; }
+    list() { return mockListDirectory(this.uri); }
   }
   class MockFile {
     constructor(parent, name) {
@@ -54,6 +60,7 @@ jest.mock('expo-file-system', () => {
       this.exists = true;
     }
     async copy(destination) { mockCopyFile(this.uri, destination.uri); }
+    async write(bytes) { return mockWriteFile(this.uri, bytes); }
     delete() { mockDeleteFile(this.uri); this.exists = false; }
     createUploadTask(url, options) {
       mockCreateUploadTask(url, options);
@@ -83,10 +90,26 @@ jest.mock('expo-file-system', () => {
     __mockDeleteFile: mockDeleteFile,
     __mockCreateUploadTask: mockCreateUploadTask,
     __mockDeleteDirectory: mockDeleteDirectory,
+    __mockListDirectory: mockListDirectory,
+    __mockWriteFile: mockWriteFile,
     __setUploadResponse: (response) => { uploadResponse = response; },
     __setHoldUpload: (value) => { holdUpload = value; },
   };
 });
+
+jest.mock('expo-media-library', () => {
+  const mockRequestPermission = jest.fn(async () => ({ granted: true }));
+  return {
+    usePermissions: jest.fn(() => [{ granted: true }, mockRequestPermission]),
+    Asset: { create: jest.fn(async (uri) => ({ id: 'saved-image', uri })) },
+    __mockRequestPermission: mockRequestPermission,
+  };
+});
+
+jest.mock('expo-sharing', () => ({
+  isAvailableAsync: jest.fn(async () => true),
+  shareAsync: jest.fn(async () => {}),
+}));
 
 let App;
 beforeAll(() => {
@@ -159,6 +182,34 @@ const errorResponse = (status, code, message) => ({
   text: async () => JSON.stringify({ error: { code, message } }),
 });
 
+function makeImageBytes() {
+  return new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0, 0, 0, 0, 0, 0, 0]);
+}
+
+function makeJpegBytes() {
+  return new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x02, 0xff, 0xd9]);
+}
+
+function makeImageResponse({ status = 200, contentType = 'image/png', contentLength = null, chunks = [makeImageBytes()] } = {}, signal) {
+  let index = 0;
+  const reader = {
+    read: jest.fn(async () => index < chunks.length ? { done: false, value: chunks[index++] } : { done: true, value: undefined }),
+    cancel: jest.fn(async () => {}),
+    releaseLock: jest.fn(),
+  };
+  const body = { getReader: jest.fn(() => reader), cancel: jest.fn(async () => {}) };
+  const response = {
+    ok: status >= 200 && status < 300,
+    status,
+    headers: { get: (name) => name.toLowerCase() === 'content-type' ? contentType : name.toLowerCase() === 'content-length' ? contentLength : null },
+    body,
+    __reader: reader,
+  };
+  if (signal) signal.addEventListener('abort', () => { void reader.cancel(); }, { once: true });
+  lastImageResponse = response;
+  return response;
+}
+
 const MODELS_ALL = {
   provider: 'Groq',
   models: [
@@ -170,6 +221,8 @@ const MODELS_ALL = {
 
 let streams;
 let modelsPayload;
+let imageResponse;
+let lastImageResponse;
 
 function mockBackend() {
   global.fetch = jest.fn(async (url) => {
@@ -179,6 +232,15 @@ function mockBackend() {
     throw new Error('unexpected url ' + url);
   });
   expoFetch.mockImplementation(async (url, init) => {
+    if (String(url).endsWith('/api/images/generate')) {
+      if (imageResponse === 'pending') {
+        const pendingStream = createStream(init.signal);
+        const response = { ok: true, status: 200, headers: { get: (name) => name.toLowerCase() === 'content-type' ? 'image/png' : null }, body: pendingStream.body };
+        lastImageResponse = { ...response, __stream: pendingStream };
+        return response;
+      }
+      return makeImageResponse(imageResponse, init.signal);
+    }
     const s = createStream(init.signal);
     s.url = url;
     s.init = init;
@@ -206,12 +268,23 @@ async function send(text) {
 beforeEach(async () => {
   streams = [];
   modelsPayload = MODELS_ALL;
+  imageResponse = { status: 200, contentType: 'image/png', contentLength: null, chunks: [makeImageBytes()] };
+  lastImageResponse = null;
   await AsyncStorage.clear();
   jest.clearAllMocks();
+  MediaLibrary.usePermissions.mockReturnValue([{ granted: true }, MediaLibrary.__mockRequestPermission]);
+  MediaLibrary.__mockRequestPermission.mockReset().mockResolvedValue({ granted: true });
+  MediaLibrary.Asset.create.mockReset().mockImplementation(async (uri) => ({ id: 'saved-image', uri }));
+  Sharing.isAvailableAsync.mockReset().mockResolvedValue(true);
+  Sharing.shareAsync.mockReset().mockResolvedValue(undefined);
   const audio = jest.requireMock('expo-audio');
   audio.__mockRequestRecordingPermissionsAsync.mockResolvedValue({ granted: true });
   audio.__mockRecorder.uri = 'file:///cache/voice-recording.m4a';
   const fileSystem = jest.requireMock('expo-file-system');
+  fileSystem.__mockDeleteFile.mockReset();
+  fileSystem.__mockDeleteDirectory.mockReset();
+  fileSystem.__mockListDirectory.mockReset().mockReturnValue([]);
+  fileSystem.__mockWriteFile.mockReset().mockResolvedValue(undefined);
   fileSystem.__setUploadResponse({ status: 200, body: JSON.stringify({ text: 'Transcribed speech.' }) });
   fileSystem.__setHoldUpload(false);
   mockBackend();
@@ -358,6 +431,188 @@ describe('layout', () => {
     await screen.findByText('A concise answer.');
     expect(screen.getAllByText('GPT-OSS 20B')).toHaveLength(2);
     expect(screen.getAllByText('Lumora')).toHaveLength(1);
+  });
+
+  it('keeps the Image Studio action available in the compact header layout', async () => {
+    const originalWindow = Dimensions.get('window');
+    const originalScreen = Dimensions.get('screen');
+    const dimensions = { width: 320, height: 740, scale: 1, fontScale: 1 };
+    Dimensions.set({ window: dimensions, screen: dimensions });
+    let rendered;
+    try {
+      rendered = await renderReady();
+      expect(screen.getByLabelText('Image Studio')).toBeTruthy();
+      expect(StyleSheet.flatten(screen.getByTestId('header-actions').props.style)).toMatchObject({ width: 92, flexWrap: 'wrap' });
+    } finally {
+      rendered?.unmount();
+      Dimensions.set({ window: originalWindow, screen: originalScreen });
+    }
+  });
+});
+
+describe('Image Studio integration', () => {
+  const openStudio = async () => {
+    await fireEvent.press(screen.getByLabelText('Image Studio'));
+    await screen.findByLabelText('Image prompt');
+  };
+
+  it('validates empty prompts and keeps generation separate from chat sending', async () => {
+    await renderReady();
+    await openStudio();
+    await fireEvent.press(screen.getByLabelText('Generate image'));
+    await screen.findByText('Describe the image you want to create.');
+    expect(expoFetch).not.toHaveBeenCalled();
+    expect(streams).toHaveLength(0);
+  });
+
+  it('sends an authenticated prompt and selected ratio and writes a temporary image preview', async () => {
+    await renderReady();
+    await openStudio();
+    await fireEvent.changeText(screen.getByLabelText('Image prompt'), 'A luminous cyan garden at midnight');
+    await fireEvent.press(screen.getByLabelText('16:9'));
+    await fireEvent.press(screen.getByLabelText('Generate image'));
+
+    await screen.findByLabelText('Generated image preview');
+    const [url, options] = expoFetch.mock.calls.find(([requestUrl]) => String(requestUrl).endsWith('/api/images/generate'));
+    expect(url).toBe('http://localhost:8787/api/images/generate');
+    expect(options.method).toBe('POST');
+    expect(options.headers).toMatchObject({ Accept: 'image/png, image/jpeg', Authorization: 'Bearer local-test-client-token-not-a-secret', 'Content-Type': 'application/json' });
+    expect(JSON.parse(options.body)).toEqual({ prompt: 'A luminous cyan garden at midnight', aspectRatio: '16:9' });
+    const fileSystem = jest.requireMock('expo-file-system');
+    expect(fileSystem.__mockWriteFile).toHaveBeenCalledTimes(1);
+    const [fileUri, bytes] = fileSystem.__mockWriteFile.mock.calls[0];
+    expect(fileUri).toMatch(/^file:\/\/\/cache\/lumora-image-.+\.png$/);
+    expect(bytes).toBeInstanceOf(Uint8Array);
+    expect(Array.from(bytes)).toEqual(Array.from(makeImageBytes()));
+    expect(screen.getByTestId('image-preview-frame').props.style.at(-1).aspectRatio).toBeCloseTo(16 / 9);
+    expect(streams).toHaveLength(0);
+  });
+
+  it.each([['1:1', 1], ['9:16', 9 / 16], ['4:3', 4 / 3]])('matches %s selection in the generated preview', async (ratio, aspectRatio) => {
+    await renderReady();
+    await openStudio();
+    await fireEvent.changeText(screen.getByLabelText('Image prompt'), 'A framed composition');
+    await fireEvent.press(screen.getByLabelText(ratio));
+    await fireEvent.press(screen.getByLabelText('Generate image'));
+    await screen.findByLabelText('Generated image preview');
+    expect(screen.getByTestId('image-preview-frame').props.style.at(-1).aspectRatio).toBeCloseTo(aspectRatio);
+  });
+
+  it('uses a JPEG cache extension for JPEG output', async () => {
+    imageResponse = { status: 200, contentType: 'image/jpeg', chunks: [makeJpegBytes()] };
+    await renderReady();
+    await openStudio();
+    await fireEvent.changeText(screen.getByLabelText('Image prompt'), 'A graphite moon');
+    await fireEvent.press(screen.getByLabelText('Generate image'));
+    await screen.findByLabelText('Generated image preview');
+    expect(jest.requireMock('expo-file-system').__mockWriteFile.mock.calls[0][0]).toMatch(/\.jpg$/);
+  });
+
+  it('cleans only Lumora temporary images on startup', async () => {
+    const fileSystem = jest.requireMock('expo-file-system');
+    const stale = new fileSystem.File(fileSystem.Paths.cache, 'lumora-image-1700000000000-old.png');
+    const unrelated = new fileSystem.File(fileSystem.Paths.cache, 'user-download.jpg');
+    const lookalike = new fileSystem.File(fileSystem.Paths.cache, 'lumora-image-1700000000000-old.png.backup');
+    fileSystem.__mockListDirectory.mockReturnValue([stale, unrelated, lookalike]);
+    await renderReady();
+    expect(fileSystem.__mockDeleteFile).toHaveBeenCalledWith(stale.uri);
+    expect(fileSystem.__mockDeleteFile).not.toHaveBeenCalledWith(unrelated.uri);
+    expect(fileSystem.__mockDeleteFile).not.toHaveBeenCalledWith(lookalike.uri);
+  });
+
+  it('deletes a partial cache file when writing fails', async () => {
+    const fileSystem = jest.requireMock('expo-file-system');
+    fileSystem.__mockWriteFile.mockRejectedValueOnce(new Error('synthetic write failure'));
+    await renderReady();
+    await openStudio();
+    await fireEvent.changeText(screen.getByLabelText('Image prompt'), 'A violet dusk');
+    await fireEvent.press(screen.getByLabelText('Generate image'));
+    await screen.findByText(/could not generate this image/i);
+    expect(fileSystem.__mockDeleteFile).toHaveBeenCalledWith(fileSystem.__mockWriteFile.mock.calls[0][0]);
+  });
+
+  it('requests photo permission only on Save and supports Share and close cleanup', async () => {
+    await renderReady();
+    await openStudio();
+    await fireEvent.changeText(screen.getByLabelText('Image prompt'), 'A crystalline violet moon');
+    await fireEvent.press(screen.getByLabelText('Generate image'));
+    await screen.findByLabelText('Generated image preview');
+    expect(MediaLibrary.__mockRequestPermission).not.toHaveBeenCalled();
+    await fireEvent.press(screen.getByLabelText('Save image to Photos'));
+    await waitFor(() => expect(MediaLibrary.Asset.create).toHaveBeenCalledWith(expect.stringMatching(/^file:\/\/\/cache\/lumora-image-/)));
+    expect(MediaLibrary.__mockRequestPermission).not.toHaveBeenCalled();
+    await fireEvent.press(screen.getByLabelText('Share generated image'));
+    expect(Sharing.shareAsync).toHaveBeenCalledWith(expect.stringMatching(/^file:\/\/\/cache\/lumora-image-/), expect.objectContaining({ mimeType: 'image/png' }));
+    const uri = jest.requireMock('expo-file-system').__mockWriteFile.mock.calls[0][0];
+    await fireEvent.press(screen.getByLabelText('Close Image Studio'));
+    await waitFor(() => expect(jest.requireMock('expo-file-system').__mockDeleteFile).toHaveBeenCalledWith(uri));
+    expect(screen.queryByLabelText('Generated image preview')).toBeNull();
+  });
+
+  it('keeps the preview when photo access is denied and sanitizes save failures', async () => {
+    MediaLibrary.usePermissions.mockReturnValue([{ granted: false }, MediaLibrary.__mockRequestPermission]);
+    MediaLibrary.__mockRequestPermission.mockResolvedValueOnce({ granted: false });
+    await renderReady();
+    await openStudio();
+    await fireEvent.changeText(screen.getByLabelText('Image prompt'), 'A delicate paper sculpture');
+    await fireEvent.press(screen.getByLabelText('Generate image'));
+    await screen.findByLabelText('Generated image preview');
+    await fireEvent.press(screen.getByLabelText('Save image to Photos'));
+    await screen.findByText('Photo access was not granted. You can still share the image.');
+    expect(screen.getByLabelText('Generated image preview')).toBeTruthy();
+
+    MediaLibrary.Asset.create.mockRejectedValueOnce(new Error('synthetic platform error'));
+    MediaLibrary.usePermissions.mockReturnValue([{ granted: true }, MediaLibrary.__mockRequestPermission]);
+    await fireEvent.press(screen.getByLabelText('Save image to Photos'));
+    await screen.findByText('Could not save this image. Please try again.');
+    expect(screen.queryByText(/synthetic platform error/)).toBeNull();
+  });
+
+  it('shows progress, aborts on Cancel, and prevents stale preview creation', async () => {
+    imageResponse = 'pending';
+    await renderReady();
+    await openStudio();
+    await fireEvent.changeText(screen.getByLabelText('Image prompt'), 'A slow landscape');
+    void fireEvent.press(screen.getByLabelText('Generate image'));
+    await screen.findByText('Creating your image');
+    await fireEvent.press(screen.getByLabelText('Cancel image generation'));
+    expect(lastImageResponse.__stream).toBeTruthy();
+    const request = expoFetch.mock.calls.find(([url]) => String(url).endsWith('/api/images/generate'));
+    expect(request[1].signal.aborted).toBe(true);
+    await screen.findByText(/Generation cancelled/);
+    expect(screen.getByLabelText('Try image generation again')).toBeTruthy();
+    expect(jest.requireMock('expo-file-system').__mockWriteFile).not.toHaveBeenCalled();
+    expect(streams).toHaveLength(0);
+  });
+
+  it('maps rate limiting, supports retry, and cancels oversized streamed responses', async () => {
+    imageResponse = { status: 429, contentType: 'application/json', chunks: [encoder.encode(JSON.stringify({ error: { code: 'image_provider_rate_limited' } }))] };
+    await renderReady();
+    await openStudio();
+    await fireEvent.changeText(screen.getByLabelText('Image prompt'), 'Retry this image');
+    await fireEvent.press(screen.getByLabelText('Generate image'));
+    await screen.findByText(/temporarily rate limited/i);
+
+    imageResponse = { status: 200, contentType: 'image/png', contentLength: 12 * 1024 * 1024 + 1, chunks: [makeImageBytes()] };
+    await fireEvent.press(screen.getByLabelText('Retry image generation'));
+    await screen.findByText(/too large to save in the app cache/i);
+    expect(lastImageResponse.__reader.cancel).toHaveBeenCalled();
+    expect(jest.requireMock('expo-file-system').__mockWriteFile).not.toHaveBeenCalled();
+  });
+
+  it('clearly explains that generation stays disabled until billing controls are verified', async () => {
+    imageResponse = {
+      status: 503,
+      contentType: 'application/json',
+      chunks: [encoder.encode(JSON.stringify({ error: { code: 'image_generation_disabled', message: 'private backend details' } }))],
+    };
+    await renderReady();
+    await openStudio();
+    await fireEvent.changeText(screen.getByLabelText('Image prompt'), 'A quiet cyan forest');
+    await fireEvent.press(screen.getByLabelText('Generate image'));
+    await screen.findByText('Image generation is disabled until Preview billing controls are verified.');
+    expect(screen.queryByText(/private backend details/)).toBeNull();
+    expect(jest.requireMock('expo-file-system').__mockWriteFile).not.toHaveBeenCalled();
   });
 });
 

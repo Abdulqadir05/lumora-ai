@@ -6,6 +6,7 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
+import zlib from 'node:zlib';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
@@ -82,6 +83,49 @@ function mockCompletion(body, last) {
 
 // ─── Mock provider ──────────────────────────────────────────────────────────
 const provider = { calls: [], transcriptions: [], ttsCalls: [], aborted: 0, abortedTranscriptions: 0, abortedTts: 0, port: 0, fxCalls: 0 };
+provider.imageCalls = [];
+provider.abortedImages = 0;
+
+function mockPngImage({ width = 1, height = 1, omitHeader = false, omitData = false, omitEnd = false, corruptChunkLength = false, corruptCrc = false } = {}) {
+  const crc32 = (buffer) => {
+    let crc = 0xffffffff;
+    for (const byte of buffer) {
+      crc ^= byte;
+      for (let bit = 0; bit < 8; bit += 1) crc = (crc >>> 1) ^ ((crc & 1) ? 0xedb88320 : 0);
+    }
+    return (crc ^ 0xffffffff) >>> 0;
+  };
+  const chunk = (type, data) => {
+    const name = Buffer.from(type, 'ascii');
+    const output = Buffer.alloc(12 + data.length);
+    output.writeUInt32BE(data.length, 0);
+    name.copy(output, 4);
+    data.copy(output, 8);
+    output.writeUInt32BE(crc32(Buffer.concat([name, data])), 8 + data.length);
+    return output;
+  };
+  const header = Buffer.alloc(13);
+  header.writeUInt32BE(width, 0);
+  header.writeUInt32BE(height, 4);
+  header.set([8, 6, 0, 0, 0], 8);
+  const chunks = [];
+  if (!omitHeader) chunks.push(chunk('IHDR', header));
+  if (!omitData) chunks.push(chunk('IDAT', zlib.deflateSync(Buffer.from([0, 255, 0, 0, 255]))));
+  if (!omitEnd) chunks.push(chunk('IEND', Buffer.alloc(0)));
+  const image = Buffer.concat([Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]), ...chunks]);
+  if (corruptChunkLength && !omitHeader && !omitData) image.writeUInt32BE(0x7fffffff, 33);
+  if (corruptCrc && !omitHeader) image[29] ^= 0xff;
+  return image;
+}
+
+function mockJpegImage(width = 1, height = 1) {
+  const sof = Buffer.from([0xff, 0xc0, 0x00, 0x0b, 0x08, 0, 0, 0, 0, 1, 1, 0x11, 0]);
+  sof.writeUInt16BE(height, 5);
+  sof.writeUInt16BE(width, 7);
+  const sos = Buffer.from([0xff, 0xda, 0x00, 0x08, 1, 1, 0, 0, 0x3f, 0]);
+  return Buffer.concat([Buffer.from([0xff, 0xd8]), sof, sos, Buffer.from([0x01, 0x02]), Buffer.from([0xff, 0xd9])]);
+}
+
 const mock = http.createServer((req, res) => {
   if (req.url === '/__test__/fx-hit' && req.method === 'POST') {
     provider.fxCalls += 1;
@@ -212,6 +256,87 @@ const mock = http.createServer((req, res) => {
     });
     return;
   }
+  if (req.url === '/v1/images/generations' && req.method === 'POST') {
+    const chunks = [];
+    req.on('data', (chunk) => chunks.push(chunk));
+    req.on('end', () => {
+      let body;
+      try { body = JSON.parse(Buffer.concat(chunks).toString('utf8')); }
+      catch { res.writeHead(400).end('{"error":"private provider detail"}'); return; }
+      const call = {
+        prompt: body.prompt,
+        model: body.model,
+        size: body.size,
+        n: body.n,
+        responseFormat: body.response_format,
+        safePresent: Object.hasOwn(body, 'safe'),
+        safe: body.safe,
+        bearerPresent: /^Bearer \S+$/.test(req.headers.authorization || ''),
+      };
+      provider.imageCalls.push(call);
+      if (String(body.prompt).includes('IMAGE_HTTP_401')) return res.writeHead(401).end('{"error":"private auth detail"}');
+      if (String(body.prompt).includes('IMAGE_HTTP_402')) return res.writeHead(402).end('{"error":"private budget detail"}');
+      if (String(body.prompt).includes('IMAGE_HTTP_429')) return res.writeHead(429).end('{"error":"private rate detail"}');
+      if (String(body.prompt).includes('IMAGE_HTTP_500')) return res.writeHead(500).end('{"error":"private provider detail"}');
+      if (String(body.prompt).includes('IMAGE_BAD_JSON')) return res.writeHead(200, { 'content-type': 'application/json' }).end('{');
+      if (String(body.prompt).includes('IMAGE_BAD_FORMAT')) return res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ data: [{ b64_json: Buffer.from('<svg/>').toString('base64') }] }));
+      if (String(body.prompt).includes('IMAGE_BAD_BASE64')) return res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ data: [{ b64_json: 'not*canonical-base64' }] }));
+      if (String(body.prompt).includes('IMAGE_STREAM_OVERSIZED')) {
+        res.writeHead(200, { 'content-type': 'application/json', 'transfer-encoding': 'chunked' });
+        res.write('{"data":[{"b64_json":"');
+        const block = 'A'.repeat(64 * 1024);
+        let sent = 0;
+        const pump = () => {
+          while (!res.destroyed && sent < 18 * 1024 * 1024) {
+            sent += block.length;
+            if (!res.write(block)) {
+              res.once('drain', pump);
+              return;
+            }
+          }
+          if (!res.destroyed) res.end('"}]}');
+        };
+        pump();
+        return;
+      }
+      if (String(body.prompt).startsWith('IMAGE_PNG_')) {
+        const prompt = String(body.prompt);
+        const image = prompt.includes('MISSING_IHDR') ? mockPngImage({ omitHeader: true })
+          : prompt.includes('MISSING_IDAT') ? mockPngImage({ omitData: true })
+            : prompt.includes('MISSING_IEND') ? mockPngImage({ omitEnd: true })
+              : prompt.includes('BAD_DIMENSIONS') ? mockPngImage({ width: 0, height: 1 })
+                : prompt.includes('OVERSIZED_DIMENSIONS') ? mockPngImage({ width: 5000, height: 1 })
+                  : prompt.includes('BAD_CHUNK') ? mockPngImage({ corruptChunkLength: true })
+                    : prompt.includes('BAD_CRC') ? mockPngImage({ corruptCrc: true })
+                      : mockPngImage();
+        return res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ data: [{ b64_json: image.toString('base64') }] }));
+      }
+      if (/(?:IMAGE_JPEG|IMAGE_BAD_JPEG)/.test(String(body.prompt))) {
+        const jpeg = String(body.prompt).includes('IMAGE_JPEG_OVERSIZED') ? mockJpegImage(5000, 4000)
+          : String(body.prompt).includes('IMAGE_BAD_JPEG') ? Buffer.from([0xff, 0xd8, 0xff, 0xd9])
+            : mockJpegImage();
+        return res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ data: [{ b64_json: jpeg.toString('base64') }] }));
+      }
+      if (String(body.prompt).includes('IMAGE_OVERSIZED')) {
+        return res.writeHead(200, { 'content-type': 'application/json', 'content-length': String(17 * 1024 * 1024) }).end();
+      }
+      if (String(body.prompt).includes('IMAGE_DELAY')) {
+        let done = false;
+        const timer = setTimeout(() => {
+          done = true;
+          res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ data: [{ b64_json: mockPngImage().toString('base64') }] }));
+        }, 1_500);
+        res.on('close', () => {
+          clearTimeout(timer);
+          if (!done) provider.abortedImages += 1;
+        });
+        return;
+      }
+      const image = mockPngImage();
+      res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ data: [{ b64_json: image.toString('base64') }] }));
+    });
+    return;
+  }
   let raw = '';
   req.on('data', (c) => (raw += c));
   req.on('end', () => {
@@ -269,7 +394,7 @@ async function startServer(env) {
   await new Promise((resolve) => portProbe.close(resolve));
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, ['--require', WEATHER_MOCK, SERVER], {
-      env: { PATH: process.env.PATH, PORT: String(port), NODE_ENV: 'test', DOTENV_CONFIG_PATH: '/dev/null', TRUST_PROXY: '', LLM_BASE_URL: `http://127.0.0.1:${provider.port}/v1`, LLM_API_KEY: 'sk-secret-test-value', TAVILY_API_KEY: '', LUMORA_TEST_GEMINI_TTS_URL: `http://127.0.0.1:${provider.port}/v1beta/interactions`, LUMORA_TEST_FX_OBSERVER_URL: `http://127.0.0.1:${provider.port}/__test__/fx-hit`, ...env },
+      env: { PATH: process.env.PATH, PORT: String(port), NODE_ENV: 'test', DOTENV_CONFIG_PATH: '/dev/null', TRUST_PROXY: '', LLM_BASE_URL: `http://127.0.0.1:${provider.port}/v1`, LLM_API_KEY: 'sk-secret-test-value', TAVILY_API_KEY: '', LUMORA_TEST_GEMINI_TTS_URL: `http://127.0.0.1:${provider.port}/v1beta/interactions`, LUMORA_TEST_POLLINATIONS_IMAGE_URL: `http://127.0.0.1:${provider.port}/v1/images/generations`, LUMORA_TEST_ENABLE_IMAGE_GENERATION: 'true', LUMORA_TEST_FX_OBSERVER_URL: `http://127.0.0.1:${provider.port}/__test__/fx-hit`, ...env },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     children.push(child);
@@ -287,8 +412,38 @@ async function startServer(env) {
 
 const auth = { Authorization: `Bearer ${TOKEN}`, 'Content-Type': 'application/json' };
 const ttsBody = (text) => JSON.stringify({ text });
+const imageBody = (prompt, aspectRatio = '1:1') => JSON.stringify({ prompt, aspectRatio });
 const chatBody = (content, extra = {}) => JSON.stringify({ model: 'gpt-oss-20b', messages: [{ role: 'user', content }], ...extra });
 const chatConversationBody = (messages, extra = {}) => JSON.stringify({ model: 'gpt-oss-20b', messages, ...extra });
+
+test('image generation remains disabled outside the test environment even when a provider key is present', async () => {
+  const { url } = await startServer({
+    NODE_ENV: 'development',
+    HOST: '127.0.0.1',
+    LUMORA_CLIENT_TOKENS: TOKEN,
+    POLLINATIONS_API_KEY: 'synthetic-test-value-only',
+    LUMORA_TEST_ENABLE_IMAGE_GENERATION: 'true',
+  });
+  const before = provider.imageCalls.length;
+  const response = await fetch(`${url}/api/images/generate`, { method: 'POST', headers: auth, body: imageBody('A safe offline test prompt') });
+  assert.equal(response.status, 503);
+  assert.equal(response.headers.get('cache-control'), 'no-store, private');
+  assert.equal((await response.json()).error.code, 'image_generation_disabled');
+  assert.equal(provider.imageCalls.length, before);
+});
+
+test('image test provider URL fails closed instead of falling back to Pollinations', async () => {
+  const { url } = await startServer({
+    LUMORA_CLIENT_TOKENS: TOKEN,
+    POLLINATIONS_API_KEY: 'synthetic-test-value-only',
+    LUMORA_TEST_POLLINATIONS_IMAGE_URL: '',
+  });
+  const before = provider.imageCalls.length;
+  const response = await fetch(`${url}/api/images/generate`, { method: 'POST', headers: auth, body: imageBody('Offline fixture guard') });
+  assert.equal(response.status, 502);
+  assert.equal((await response.json()).error.code, 'image_provider_unavailable');
+  assert.equal(provider.imageCalls.length, before);
+});
 
 function m4aBytes(marker = 'AUDIO_SENTINEL') {
   const header = Buffer.alloc(20);
@@ -400,6 +555,7 @@ test('protected chat and tool routes reject missing, invalid, and malformed bear
     { method: 'POST', url: `${api}/api/tools/currency`, body: '{}' },
     { method: 'POST', url: `${api}/api/voice/transcribe`, body: '{}' },
     { method: 'POST', url: `${api}/api/tts`, body: '{}' },
+    { method: 'POST', url: `${api}/api/images/generate`, body: '{}' },
   ];
   const malformed = ['Basic token', 'Bearer', 'Bearer  ' + TOKEN, `Bearer ${TOKEN} extra`];
   for (const route of routes) {
@@ -820,6 +976,211 @@ test('Gemini TTS client disconnect aborts upstream and releases the concurrency 
   }
   assert.equal(retryResponse.status, 200, 'concurrency slot should be released after disconnect');
   assert.equal(provider.ttsCalls.length, beforeCalls + 2);
+});
+
+test('image generation validates the prompt and aspect ratio before contacting Pollinations', async () => {
+  const { url } = await startServer({
+    LUMORA_CLIENT_TOKENS: TOKEN,
+    POLLINATIONS_API_KEY: 'pollinations-test-secret-value',
+    IMAGE_MAX_PROMPT_CHARS: '8',
+    IMAGE_RATE_PER_MIN: '1000',
+  });
+  const before = provider.imageCalls.length;
+  for (const body of [JSON.stringify({ prompt: '' }), JSON.stringify({ prompt: '   ' }), JSON.stringify({ prompt: 42, aspectRatio: '1:1' }), imageBody('short', '3:2')]) {
+    const response = await fetch(`${url}/api/images/generate`, { method: 'POST', headers: auth, body });
+    assert.equal(response.status, 400);
+    assert.equal(response.headers.get('cache-control'), 'no-store, private');
+    assert.match((await response.json()).error.code, /^image_(prompt_required|aspect_ratio_invalid)$/);
+  }
+  const tooLong = await fetch(`${url}/api/images/generate`, { method: 'POST', headers: auth, body: imageBody('123456789') });
+  assert.equal(tooLong.status, 413);
+  assert.equal(tooLong.headers.get('cache-control'), 'no-store, private');
+  assert.equal((await tooLong.json()).error.code, 'image_prompt_too_long');
+  assert.equal(provider.imageCalls.length, before);
+});
+
+test('image generation forwards authenticated bounded JSON to the verified model and returns temporary PNG bytes', async () => {
+  const { url, child } = await startServer({
+    LUMORA_CLIENT_TOKENS: TOKEN,
+    POLLINATIONS_API_KEY: 'pollinations-test-secret-value',
+    IMAGE_RATE_PER_MIN: '1000',
+  });
+  const prompt = 'IMAGE_PROMPT_SENTINEL cinematic aurora over obsidian mountains';
+  const sizes = { '1:1': '1024x1024', '16:9': '1024x576', '9:16': '576x1024', '4:3': '1024x768' };
+  for (const [aspectRatio, size] of Object.entries(sizes)) {
+    const response = await fetch(`${url}/api/images/generate`, { method: 'POST', headers: auth, body: imageBody(prompt, aspectRatio) });
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get('content-type'), 'image/png');
+    assert.equal(response.headers.get('cache-control'), 'no-store, private');
+    assert.equal(response.headers.get('x-content-type-options'), 'nosniff');
+    assert.equal(response.headers.get('content-disposition'), 'inline; filename="lumora-image.png"');
+    const bytes = Buffer.from(await response.arrayBuffer());
+    assert.deepEqual(bytes, mockPngImage());
+    assert.equal(Number(response.headers.get('content-length')), bytes.length);
+    const call = provider.imageCalls.at(-1);
+    assert.deepEqual(call, {
+      prompt,
+      model: 'black-forest-labs/flux.1-schnell',
+      size,
+      n: 1,
+      responseFormat: 'b64_json',
+      safePresent: false,
+      safe: undefined,
+      bearerPresent: true,
+    });
+  }
+  assert.doesNotMatch(child.getOutput(), /IMAGE_PROMPT_SENTINEL|pollinations-test-secret-value/);
+});
+
+test('image generation rejects invalid base64 and malformed PNG chunks, dimensions, and required chunks', async () => {
+  const { url } = await startServer({
+    LUMORA_CLIENT_TOKENS: TOKEN,
+    POLLINATIONS_API_KEY: 'pollinations-test-secret-value',
+    IMAGE_RATE_PER_MIN: '1000',
+  });
+  const cases = [
+    'IMAGE_BAD_BASE64',
+    'IMAGE_PNG_BAD_CHUNK',
+    'IMAGE_PNG_BAD_DIMENSIONS',
+    'IMAGE_PNG_OVERSIZED_DIMENSIONS',
+    'IMAGE_PNG_MISSING_IHDR',
+    'IMAGE_PNG_MISSING_IDAT',
+    'IMAGE_PNG_MISSING_IEND',
+    'IMAGE_PNG_BAD_CRC',
+  ];
+  for (const prompt of cases) {
+    const response = await fetch(`${url}/api/images/generate`, { method: 'POST', headers: auth, body: imageBody(prompt) });
+    assert.equal(response.status, 502, prompt);
+    assert.equal((await response.json()).error.code, 'image_invalid_response', prompt);
+    assert.equal(response.headers.get('cache-control'), 'no-store, private', prompt);
+  }
+});
+
+test('image generation accepts bounded JPEG output and rejects malformed or oversized JPEG dimensions', async () => {
+  const { url } = await startServer({
+    LUMORA_CLIENT_TOKENS: TOKEN,
+    POLLINATIONS_API_KEY: 'pollinations-test-secret-value',
+    IMAGE_RATE_PER_MIN: '1000',
+  });
+  const valid = await fetch(`${url}/api/images/generate`, { method: 'POST', headers: auth, body: imageBody('IMAGE_JPEG valid') });
+  assert.equal(valid.status, 200);
+  assert.equal(valid.headers.get('content-type'), 'image/jpeg');
+  assert.deepEqual(Buffer.from(await valid.arrayBuffer()), mockJpegImage());
+  assert.equal(valid.headers.get('cache-control'), 'no-store, private');
+
+  for (const prompt of ['IMAGE_BAD_JPEG malformed', 'IMAGE_JPEG_OVERSIZED dimensions']) {
+    const response = await fetch(`${url}/api/images/generate`, { method: 'POST', headers: auth, body: imageBody(prompt) });
+    assert.equal(response.status, 502);
+    assert.equal((await response.json()).error.code, 'image_invalid_response');
+    assert.equal(response.headers.get('cache-control'), 'no-store, private');
+  }
+});
+
+test('image endpoint errors, including authentication failures, are marked no-store', async () => {
+  const { url } = await startServer({ LUMORA_CLIENT_TOKENS: TOKEN, IMAGE_RATE_PER_MIN: '1000' });
+  const response = await fetch(`${url}/api/images/generate`, { method: 'POST', body: imageBody('A private prompt') });
+  assert.equal(response.status, 401);
+  assert.equal(response.headers.get('cache-control'), 'no-store, private');
+
+  const malformed = await fetch(`${url}/api/images/generate`, {
+    method: 'POST', headers: { ...auth, 'content-type': 'application/json' }, body: '{',
+  });
+  assert.equal(malformed.status, 400);
+  assert.equal(malformed.headers.get('cache-control'), 'no-store, private');
+});
+
+test('image generation fails safely when Pollinations key is missing', async () => {
+  const { url } = await startServer({ LUMORA_CLIENT_TOKENS: TOKEN, POLLINATIONS_API_KEY: '', IMAGE_RATE_PER_MIN: '1000' });
+  const before = provider.imageCalls.length;
+  const response = await fetch(`${url}/api/images/generate`, { method: 'POST', headers: auth, body: imageBody('A quiet glass city at dawn') });
+  assert.equal(response.status, 503);
+  assert.equal(response.headers.get('cache-control'), 'no-store, private');
+  assert.equal((await response.json()).error.code, 'image_not_configured');
+  assert.equal(provider.imageCalls.length, before);
+});
+
+test('image provider failures, malformed output and oversized output return sanitized errors', async () => {
+  const { url } = await startServer({
+    LUMORA_CLIENT_TOKENS: TOKEN,
+    POLLINATIONS_API_KEY: 'pollinations-test-secret-value',
+    IMAGE_RATE_PER_MIN: '1000',
+  });
+  const cases = [
+    { prompt: 'IMAGE_HTTP_401', status: 502, code: 'image_provider_auth' },
+    { prompt: 'IMAGE_HTTP_402', status: 503, code: 'image_provider_budget_exhausted' },
+    { prompt: 'IMAGE_HTTP_429', status: 503, code: 'image_provider_rate_limited' },
+    { prompt: 'IMAGE_HTTP_500', status: 502, code: 'image_provider_unavailable' },
+    { prompt: 'IMAGE_BAD_JSON', status: 502, code: 'image_invalid_response' },
+    { prompt: 'IMAGE_BAD_FORMAT', status: 502, code: 'image_invalid_response' },
+    { prompt: 'IMAGE_OVERSIZED', status: 502, code: 'image_invalid_response' },
+    { prompt: 'IMAGE_STREAM_OVERSIZED', status: 502, code: 'image_invalid_response' },
+  ];
+  for (const item of cases) {
+    const response = await fetch(`${url}/api/images/generate`, { method: 'POST', headers: auth, body: imageBody(item.prompt) });
+    const body = await response.text();
+    assert.equal(response.status, item.status);
+    assert.equal(JSON.parse(body).error.code, item.code);
+    assert.equal(response.headers.get('cache-control'), 'no-store, private');
+    assert.doesNotMatch(body, /private provider|private auth|private rate|pollinations-test-secret-value|IMAGE_/);
+  }
+});
+
+test('image generation enforces its route rate limit and aborts timed-out or disconnected work', async () => {
+  const limited = await startServer({
+    LUMORA_CLIENT_TOKENS: TOKEN,
+    POLLINATIONS_API_KEY: 'pollinations-test-secret-value',
+    IMAGE_RATE_PER_MIN: '1',
+    API_RATE_PER_MIN: '1000',
+  });
+  const first = await fetch(`${limited.url}/api/images/generate`, { method: 'POST', headers: auth, body: imageBody('A tiny red flower') });
+  assert.equal(first.status, 200);
+  const second = await fetch(`${limited.url}/api/images/generate`, { method: 'POST', headers: auth, body: imageBody('A tiny blue flower') });
+  assert.equal(second.status, 429);
+  assert.equal(second.headers.get('cache-control'), 'no-store, private');
+  assert.equal((await second.json()).error.code, 'rate_limited');
+
+  const timed = await startServer({
+    LUMORA_CLIENT_TOKENS: TOKEN,
+    POLLINATIONS_API_KEY: 'pollinations-test-secret-value',
+    IMAGE_GENERATION_TIMEOUT_MS: '1000',
+    IMAGE_RATE_PER_MIN: '1000',
+  });
+  const beforeTimeoutAbort = provider.abortedImages;
+  const timeoutResponse = await fetch(`${timed.url}/api/images/generate`, { method: 'POST', headers: auth, body: imageBody('IMAGE_DELAY') });
+  assert.equal(timeoutResponse.status, 504);
+  assert.equal(timeoutResponse.headers.get('cache-control'), 'no-store, private');
+  assert.equal((await timeoutResponse.json()).error.code, 'image_timeout');
+  await waitForCondition(() => provider.abortedImages > beforeTimeoutAbort);
+
+  const bounded = await startServer({
+    LUMORA_CLIENT_TOKENS: TOKEN,
+    POLLINATIONS_API_KEY: 'pollinations-test-secret-value',
+    IMAGE_MAX_CONCURRENT: '1',
+    IMAGE_RATE_PER_MIN: '1000',
+  });
+  const beforeCalls = provider.imageCalls.length;
+  const beforeDisconnectAbort = provider.abortedImages;
+  const clientAbort = new AbortController();
+  const pending = fetch(`${bounded.url}/api/images/generate`, {
+    method: 'POST', headers: auth, body: imageBody('IMAGE_DELAY'), signal: clientAbort.signal,
+  }).then(() => null, (error) => error);
+  await waitForCondition(() => provider.imageCalls.length > beforeCalls);
+  const busy = await fetch(`${bounded.url}/api/images/generate`, { method: 'POST', headers: auth, body: imageBody('Must not reach provider') });
+  assert.equal(busy.status, 503);
+  assert.equal((await busy.json()).error.code, 'image_busy');
+  assert.equal(busy.headers.get('cache-control'), 'no-store, private');
+  assert.equal(provider.imageCalls.length, beforeCalls + 1);
+  clientAbort.abort();
+  assert.ok((await pending) instanceof Error);
+  await waitForCondition(() => provider.abortedImages > beforeDisconnectAbort);
+  let retry;
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    retry = await fetch(`${bounded.url}/api/images/generate`, { method: 'POST', headers: auth, body: imageBody('A blue flower after cancel') });
+    if (retry.status !== 503) break;
+    await retry.json();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.equal(retry.status, 200, 'client disconnect should release the image concurrency slot');
 });
 
 test('CORS: allowlisted origin only', async () => {

@@ -45,6 +45,15 @@
           "resizeMode": "contain",
           "backgroundColor": "#060B16"
         }
+      ],
+      [
+        "expo-media-library",
+        {
+          "photosPermission": "Allow Lumora AI to save images you choose to your photo library.",
+          "savePhotosPermission": "Allow Lumora AI to save images you choose to your photo library.",
+          "granularPermissions": ["photo"],
+          "isAccessMediaLocationEnabled": false
+        }
       ]
     ],
     "icon": "./assets/icon.png",

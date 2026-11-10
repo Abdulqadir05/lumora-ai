@@ -18,6 +18,7 @@
  *   POST /api/tools/crypto
  *   POST /api/tools/currency
  *   POST /api/voice/transcribe
+ *   POST /api/images/generate
  *
  * Run:  cp .env.example .env  →  fill LLM_API_KEY  →  npm install  →  npm start
  */
@@ -54,6 +55,13 @@ const GEMINI_API_KEY = (process.env.GEMINI_API_KEY || '').trim();
 const GEMINI_TTS_MODEL = (process.env.GEMINI_TTS_MODEL || 'gemini-3.8-flash-tts').trim();
 const GEMINI_TTS_VOICE = (process.env.GEMINI_TTS_VOICE || 'Nika').trim();
 const GEMINI_INTERACTIONS_URL = 'https://generativelanguage.googleapis.com/v1beta/interactions';
+const POLLINATIONS_API_KEY = (process.env.POLLINATIONS_API_KEY || '').trim();
+const POLLINATIONS_IMAGE_MODEL = 'black-forest-labs/flux.1-schnell';
+const POLLINATIONS_IMAGE_URL = 'https://gen.pollinations.ai/v1/images/generations';
+// Live image generation stays disabled in development and production until a
+// provider-side Quest-only, fail-closed billing guarantee is verified. The
+// explicit test-only switch is used solely by the offline mocked test suite.
+const IMAGE_GENERATION_ENABLED = NODE_ENV === 'test' && process.env.LUMORA_TEST_ENABLE_IMAGE_GENERATION === 'true';
 
 // An endpoint override exists only for offline tests and only accepts loopback.
 // Production always calls Google's fixed Interactions API origin.
@@ -1685,6 +1693,12 @@ const app = express();
 app.disable('x-powered-by');
 app.set('trust proxy', TRUST_PROXY);
 app.use(helmet());
+// Image prompts and generated media are transient; mark every image endpoint
+// response no-store before CORS, HTTPS, limiter, auth, parser, or route can fail.
+app.use('/api/images/generate', (_req, res, next) => {
+  res.set('Cache-Control', 'no-store, private');
+  next();
+});
 
 // CORS: the native app does not need CORS. Browsers are denied by default; set
 // CORS_ORIGINS (comma-separated, exact origins) only if a web client must call the API.
@@ -1793,6 +1807,28 @@ const GEMINI_TTS_MAX_AUDIO_BYTES = 12 * 1024 * 1024;
 const GEMINI_TTS_MAX_RESPONSE_BYTES = 18 * 1024 * 1024;
 const GEMINI_TTS_ERROR_BODY_MAX_BYTES = 8 * 1024;
 const GEMINI_TTS_ERROR_BODY_TIMEOUT_MS = 750;
+const boundedImageSetting = (name, fallback, min, max) => {
+  const raw = process.env[name]?.trim();
+  if (!raw || !/^\d+$/.test(raw)) return fallback;
+  const parsed = Number(raw);
+  return Number.isSafeInteger(parsed) ? Math.min(max, Math.max(min, parsed)) : fallback;
+};
+const IMAGE_RATE_PER_MIN = boundedImageSetting('IMAGE_RATE_PER_MIN', 3, 1, 60);
+const IMAGE_MAX_CONCURRENT = boundedImageSetting('IMAGE_MAX_CONCURRENT', 1, 1, 2);
+const IMAGE_GENERATION_TIMEOUT_MS = boundedImageSetting('IMAGE_GENERATION_TIMEOUT_MS', 90_000, 1_000, 180_000);
+const IMAGE_MAX_PROMPT_CHARS = boundedImageSetting('IMAGE_MAX_PROMPT_CHARS', 2_000, 1, 4_000);
+const IMAGE_MAX_BYTES = 12 * 1024 * 1024;
+const IMAGE_MAX_PROVIDER_JSON_BYTES = Math.ceil(IMAGE_MAX_BYTES / 3) * 4 + 64 * 1024;
+const IMAGE_MAX_DIMENSION = 4096;
+const IMAGE_MAX_PIXELS = 16_777_216;
+const imageLimiter = limiter(IMAGE_RATE_PER_MIN);
+const IMAGE_SIZES = Object.freeze({
+  '1:1': '1024x1024',
+  '16:9': '1024x576',
+  '9:16': '576x1024',
+  '4:3': '1024x768',
+});
+let activeImageGenerations = 0;
 const SAFE_GEMINI_TTS_ERROR_STATUSES = new Set([
   'ABORTED',
   'CANCELLED',
@@ -1921,6 +1957,47 @@ function attachGeminiTtsCancellation(req, res, next) {
     if (!res.writableEnded) controller.abort();
   });
   next();
+}
+
+function reserveImageSlot(_req, res, next) {
+  if (activeImageGenerations >= IMAGE_MAX_CONCURRENT)
+    return sendError(res, new HttpError(503, 'image_busy', 'Image generation is busy. Please try again shortly.'));
+  activeImageGenerations += 1;
+  let released = false;
+  const release = () => {
+    if (released) return;
+    released = true;
+    activeImageGenerations = Math.max(0, activeImageGenerations - 1);
+  };
+  res.once('finish', release);
+  res.once('close', release);
+  next();
+}
+
+function attachImageCancellation(req, res, next) {
+  const controller = new AbortController();
+  req.imageSignal = controller.signal;
+  if (req.aborted) controller.abort();
+  req.once('aborted', () => controller.abort());
+  res.once('close', () => {
+    if (!res.writableEnded) controller.abort();
+  });
+  next();
+}
+
+// Test-only override is restricted to the exact local fixture route. Production
+// always uses Pollinations' fixed origin and cannot be turned into an open proxy.
+function pollinationsImageUrl() {
+  if (NODE_ENV !== 'test') return POLLINATIONS_IMAGE_URL;
+  try {
+    const url = new URL(process.env.LUMORA_TEST_POLLINATIONS_IMAGE_URL || '');
+    if (url.protocol === 'http:' && isLoopbackHost(url.hostname) && url.pathname === '/v1/images/generations' && !url.search && !url.hash)
+      return url.href;
+  } catch {
+    // Reject the fixture URL and fail closed below.
+  }
+  // Never let a test run with a missing or invalid fixture URL contact the live provider.
+  throw new HttpError(503, 'image_test_provider_unavailable', 'The local image test provider is unavailable.');
 }
 
 function geminiTtsProviderError(status) {
@@ -2212,6 +2289,241 @@ async function handleGeminiTts(req, res) {
   }
 }
 
+function imageProviderError(status) {
+  if (status === 401 || status === 403)
+    return new HttpError(502, 'image_provider_auth', 'Image generation is not available because the server provider configuration was rejected.');
+  if (status === 402)
+    return new HttpError(503, 'image_provider_budget_exhausted', 'Image generation is unavailable because the provider credit or account budget is exhausted. Please try again later.');
+  if (status === 429)
+    return new HttpError(503, 'image_provider_rate_limited', 'Image generation is temporarily rate limited. Please try again shortly.');
+  if (status >= 500)
+    return new HttpError(502, 'image_provider_unavailable', 'The image service is temporarily unavailable. Please try again shortly.');
+  return new HttpError(502, 'image_provider_rejected', 'The image service could not process this prompt. Please revise it and try again.');
+}
+
+async function readBoundedPollinationsJson(response) {
+  const contentType = (response.headers.get('content-type') || '').toLowerCase();
+  if (!contentType.startsWith('application/json')) {
+    await response.body?.cancel().catch(() => {});
+    throw new HttpError(502, 'image_invalid_response', 'The image service returned an invalid response.');
+  }
+  const contentLength = Number(response.headers.get('content-length'));
+  if (Number.isFinite(contentLength) && contentLength > IMAGE_MAX_PROVIDER_JSON_BYTES) {
+    await response.body?.cancel().catch(() => {});
+    throw new HttpError(502, 'image_invalid_response', 'The image service returned an image that is too large.');
+  }
+  if (!response.body) throw new HttpError(502, 'image_invalid_response', 'The image service returned an empty response.');
+
+  const reader = response.body.getReader();
+  let body = Buffer.alloc(Number.isFinite(contentLength) && contentLength > 0
+    ? Math.min(contentLength, IMAGE_MAX_PROVIDER_JSON_BYTES)
+    : 64 * 1024);
+  let total = 0;
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      const required = total + value.byteLength;
+      if (required > IMAGE_MAX_PROVIDER_JSON_BYTES) {
+        await reader.cancel().catch(() => {});
+        throw new HttpError(502, 'image_invalid_response', 'The image service returned an image that is too large.');
+      }
+      if (required > body.length) {
+        const expanded = Buffer.alloc(Math.min(IMAGE_MAX_PROVIDER_JSON_BYTES, Math.max(required, body.length * 2)));
+        body.copy(expanded, 0, 0, total);
+        body = expanded;
+      }
+      Buffer.from(value.buffer, value.byteOffset, value.byteLength).copy(body, total);
+      total = required;
+    }
+  } finally {
+    try { reader.releaseLock(); } catch {}
+  }
+  try {
+    return JSON.parse(body.toString('utf8', 0, total));
+  } catch {
+    throw new HttpError(502, 'image_invalid_response', 'The image service returned an invalid response.');
+  }
+}
+
+function validImageDimensions(width, height) {
+  return Number.isInteger(width) && Number.isInteger(height) && width > 0 && height > 0 &&
+    width <= IMAGE_MAX_DIMENSION && height <= IMAGE_MAX_DIMENSION && width * height <= IMAGE_MAX_PIXELS;
+}
+
+// This is a bounded structural/dimension check, not a PNG decoder: it does not
+// decompress IDAT data or validate decoded pixels. Chunk CRCs are checked to
+// catch corrupt/truncated chunks. The image bytes and pixel count are capped
+// before they can be passed to a client image decoder.
+const PNG_CRC_TABLE = Uint32Array.from({ length: 256 }, (_, value) => {
+  let crc = value;
+  for (let bit = 0; bit < 8; bit += 1) crc = (crc >>> 1) ^ ((crc & 1) ? 0xedb88320 : 0);
+  return crc >>> 0;
+});
+
+function pngChunkCrc(bytes, start, end) {
+  let crc = 0xffffffff;
+  for (let index = start; index < end; index += 1)
+    crc = (crc >>> 8) ^ PNG_CRC_TABLE[(crc ^ bytes[index]) & 0xff];
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function hasPngStructureAndSafeDimensions(bytes) {
+  const signature = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+  if (bytes.length < 45 || !bytes.subarray(0, 8).equals(signature)) return false;
+  let offset = 8;
+  let sawHeader = false;
+  let sawData = false;
+  while (offset + 12 <= bytes.length) {
+    const size = bytes.readUInt32BE(offset);
+    const typeStart = offset + 4;
+    const chunkEnd = typeStart + 4 + size + 4;
+    if (chunkEnd > bytes.length) return false;
+    const crcOffset = typeStart + 4 + size;
+    if (bytes.readUInt32BE(crcOffset) !== pngChunkCrc(bytes, typeStart, crcOffset)) return false;
+    const type = bytes.toString('ascii', typeStart, typeStart + 4);
+    if (!sawHeader) {
+      if (type !== 'IHDR' || size !== 13) return false;
+      const width = bytes.readUInt32BE(typeStart + 4);
+      const height = bytes.readUInt32BE(typeStart + 8);
+      if (!validImageDimensions(width, height)) return false;
+      sawHeader = true;
+    }
+    if (type === 'IDAT') sawData = true;
+    if (type === 'IEND') return size === 0 && sawData && chunkEnd === bytes.length;
+    offset = chunkEnd;
+  }
+  return false;
+}
+
+// Parses JPEG markers through SOS to enforce dimensions and segment bounds. It
+// does not decode entropy-coded scan data or claim that the JPEG is fully valid.
+function jpegImageDimensions(bytes) {
+  if (bytes.length < 12 || bytes[0] !== 0xff || bytes[1] !== 0xd8 || bytes.at(-2) !== 0xff || bytes.at(-1) !== 0xd9) return null;
+  const sofMarkers = new Set([0xc0, 0xc1, 0xc2, 0xc3, 0xc5, 0xc6, 0xc7, 0xc9, 0xca, 0xcb, 0xcd, 0xce, 0xcf]);
+  let offset = 2;
+  let dimensions = null;
+
+  while (offset < bytes.length - 2) {
+    if (bytes[offset] !== 0xff) return null;
+    while (offset < bytes.length && bytes[offset] === 0xff) offset += 1;
+    if (offset >= bytes.length) return null;
+    const marker = bytes[offset++];
+    if (marker === 0xd9) return null;
+    if (marker === 0xd8 || marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) continue;
+    if (offset + 2 > bytes.length) return null;
+
+    const segmentLength = bytes.readUInt16BE(offset);
+    const segmentEnd = offset + segmentLength;
+    if (segmentLength < 2 || segmentEnd > bytes.length - 2) return null;
+
+    if (sofMarkers.has(marker)) {
+      if (segmentLength < 11) return null;
+      const height = bytes.readUInt16BE(offset + 3);
+      const width = bytes.readUInt16BE(offset + 5);
+      const components = bytes[offset + 7];
+      if (components < 1 || components > 4 || segmentLength !== 8 + components * 3 || !validImageDimensions(width, height)) return null;
+      dimensions = { width, height };
+    }
+
+    if (marker === 0xda) {
+      // A JPEG must reach a scan after its dimensions and have at least one
+      // byte of scan data before the required terminal EOI marker.
+      if (segmentLength < 8) return null;
+      const scanComponents = bytes[offset + 2];
+      if (scanComponents < 1 || scanComponents > 4 || segmentLength !== 6 + scanComponents * 2) return null;
+      const scanStart = segmentEnd;
+      if (!dimensions || scanStart >= bytes.length - 2) return null;
+      return dimensions;
+    }
+    offset = segmentEnd;
+  }
+  return null;
+}
+
+const BASE64_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+function isCanonicalBase64(value) {
+  if (typeof value !== 'string' || !value.length || value.length % 4 !== 0 || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value)) return false;
+  if (value.endsWith('==')) return (BASE64_ALPHABET.indexOf(value.at(-3)) & 0x0f) === 0;
+  if (value.endsWith('=')) return (BASE64_ALPHABET.indexOf(value.at(-2)) & 0x03) === 0;
+  return true;
+}
+
+function decodePollinationsImage(payload) {
+  const encoded = payload?.data?.[0]?.b64_json;
+  const maxEncodedLength = Math.ceil(IMAGE_MAX_BYTES / 3) * 4;
+  if (typeof encoded !== 'string' || encoded.length > maxEncodedLength || !isCanonicalBase64(encoded))
+    throw new HttpError(502, 'image_invalid_response', 'The image service returned an invalid image.');
+  const bytes = Buffer.from(encoded, 'base64');
+  if (!bytes.length || bytes.length > IMAGE_MAX_BYTES)
+    throw new HttpError(502, 'image_invalid_response', 'The image service returned an invalid image.');
+  if (hasPngStructureAndSafeDimensions(bytes)) return { bytes, contentType: 'image/png', extension: 'png' };
+  if (jpegImageDimensions(bytes)) return { bytes, contentType: 'image/jpeg', extension: 'jpg' };
+  throw new HttpError(502, 'image_invalid_response', 'The image service returned an unsupported or invalid image.');
+}
+
+async function handleImageGeneration(req, res) {
+  let link;
+  try {
+    if (!IMAGE_GENERATION_ENABLED)
+      throw new HttpError(503, 'image_generation_disabled', 'Image generation is disabled on this server.');
+    if (typeof req.body?.prompt !== 'string' || !req.body.prompt.trim())
+      throw new HttpError(400, 'image_prompt_required', 'Enter a prompt to generate an image.');
+    const prompt = req.body.prompt.trim();
+    if (prompt.length > IMAGE_MAX_PROMPT_CHARS)
+      throw new HttpError(413, 'image_prompt_too_long', `Prompts must be ${IMAGE_MAX_PROMPT_CHARS} characters or fewer.`);
+    const aspectRatio = req.body.aspectRatio;
+    const size = IMAGE_SIZES[aspectRatio];
+    if (!size) throw new HttpError(400, 'image_aspect_ratio_invalid', 'Choose a supported image aspect ratio.');
+    if (!POLLINATIONS_API_KEY) throw new HttpError(503, 'image_not_configured', 'Image generation is not configured on the server.');
+
+    link = linkedController(req.imageSignal, IMAGE_GENERATION_TIMEOUT_MS);
+    let upstream;
+    try {
+      upstream = await fetch(pollinationsImageUrl(), {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${POLLINATIONS_API_KEY}`,
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+        },
+        // Omit optional `safe`: Pollinations documents the default as off;
+        // `safe: true` enables privacy/secrets filtering, not adult-content policy.
+        // Do not silently rewrite broad creative prompts through that filter.
+        body: JSON.stringify({ prompt, model: POLLINATIONS_IMAGE_MODEL, size, n: 1, response_format: 'b64_json' }),
+        signal: link.ctrl.signal,
+      });
+    } catch {
+      if (link.state.timedOut) throw new HttpError(504, 'image_timeout', 'Image generation took too long. Please try again.');
+      if (req.imageSignal?.aborted) return;
+      throw new HttpError(502, 'image_provider_unavailable', 'The image service could not be reached. Please try again shortly.');
+    }
+    if (!upstream.ok) {
+      const error = imageProviderError(upstream.status);
+      await upstream.body?.cancel().catch(() => {});
+      if (req.imageSignal?.aborted || res.destroyed || res.writableEnded) return;
+      sendError(res, error);
+      return;
+    }
+
+    const image = decodePollinationsImage(await readBoundedPollinationsJson(upstream));
+    if (req.imageSignal?.aborted || res.destroyed || res.writableEnded) return;
+    res.status(200).set({
+      'Content-Type': image.contentType,
+      'Content-Length': String(image.bytes.length),
+      'Content-Disposition': `inline; filename="lumora-image.${image.extension}"`,
+      'Cache-Control': 'no-store, private',
+      'X-Content-Type-Options': 'nosniff',
+    }).end(image.bytes);
+  } catch (error) {
+    if (req.imageSignal?.aborted || res.destroyed || res.writableEnded) return;
+    if (link?.state.timedOut) return sendError(res, new HttpError(504, 'image_timeout', 'Image generation took too long. Please try again.'));
+    sendError(res, error instanceof HttpError ? error : new HttpError(502, 'image_provider_unavailable', 'Image generation is temporarily unavailable. Please try again shortly.'));
+  } finally {
+    link?.dispose();
+  }
+}
+
 const asyncRoute = (fn) => (req, res) => Promise.resolve(fn(req, res)).catch((e) => sendError(res, e));
 
 // The unauthenticated response is a liveness signal only. The app's authenticated
@@ -2399,6 +2711,7 @@ app.post(
   handleTranscription,
 );
 app.post('/api/tts', geminiTtsLimiter, reserveGeminiTtsSlot, attachGeminiTtsCancellation, handleGeminiTts);
+app.post('/api/images/generate', imageLimiter, reserveImageSlot, attachImageCancellation, handleImageGeneration);
 
 app.use((req, res) => sendError(res, new HttpError(404, 'not_found', 'Endpoint not found.')));
 // eslint-disable-next-line no-unused-vars
